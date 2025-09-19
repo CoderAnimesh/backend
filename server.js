@@ -65,6 +65,8 @@ CREATE TABLE IF NOT EXISTS contact_messages (
         start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         end_date TIMESTAMP NOT NULL
       );
+      
+
 CREATE TABLE if not exists gallery_images (
   id SERIAL PRIMARY KEY,
   event_id INT REFERENCES events(id) ON DELETE CASCADE,
@@ -120,7 +122,7 @@ app.use(helmet());
 app.use(express.json());
 app.use(
   cors({
-    origin: ["https://quantumquirksuoa.co.in", "https://quantumquirksuoa.netlify.app"],
+    origin: ["https://quantumquirksuoa.co.in", "https://quantumquirksuoa.netlify.app","http://localhost:5000","http://127.0.0.1:5500"],
     credentials: true,
   })
 );
