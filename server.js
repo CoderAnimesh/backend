@@ -67,7 +67,7 @@ CREATE TABLE IF NOT EXISTS contact_messages (
       );
 CREATE TABLE if not exists gallery_images (
   id SERIAL PRIMARY KEY,
-  event_id INT REFERENCES events(id),
+  event_id INT REFERENCES events(id) ON DELETE CASCADE,
   image_path TEXT NOT NULL,
   description TEXT,
   event_date DATE
