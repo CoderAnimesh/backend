@@ -3,17 +3,51 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import dotenv from "dotenv";
-import nodemailer from "nodemailer";
-import Joi from "joi";
+import { Resend } from "resend";
 import { Pool } from "pg";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-import QRCode from "qrcode"; 
+import QRCode from "qrcode";
+import multer from "multer";
+import path from "path";
+import PDFDocument from "pdfkit";
+import { fileURLToPath } from "url";
+import { customAlphabet } from "nanoid";
+import { google } from "googleapis";
+import stream from "stream";
 
 dotenv.config();
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "change_this_secret_in_prod";
+
+// ---------- WebAuthn Configuration ----------
+// CHANGE THIS TO MATCH YOUR FRONTEND URL EXACTLY
+// If using VS Code Live Server, it is usually 127.0.0.1
+// ---------- WebAuthn Configuration ----------
+// FIX: rpID must match the IP in your browser address bar
+// ---------- WebAuthn Configuration ----------
+// MUST be 'localhost'. IP addresses (127.0.0.1) are blocked by WebAuthn spec.
+const rpID = 'localhost'; 
+const origin = 'http://localhost:5500';
+
+// In-Memory Storage for Fingerprints (Note: Resets when server restarts)
+const localAuthDB = {}; 
+
+const getLocalUser = (username) => {
+    if (!localAuthDB[username]) {
+        localAuthDB[username] = { 
+            id: username, 
+            username: username, 
+            authenticators: [], 
+            currentChallenge: "" 
+        };
+    }
+    return localAuthDB[username];
+};
 
 // ---------- Postgres (Neon) ----------
 const pool = new Pool({
@@ -21,82 +55,185 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// ---------- Create tables if not exists ----------
+// ---------- Express Setup ----------
+const app = express();
+app.use(helmet());
+app.use(express.json());
+
+// CORS: Allow both localhost and 127.0.0.1
+app.use(cors({ 
+    origin: [
+        "http://localhost:5500", 
+        "http://127.0.0.1:5500", 
+        "http://localhost:5173",
+        "https://quantumquirksuoa.netlify.app",
+        "https://quantumquirksuoa.co.in"
+    ], 
+    credentials: true 
+}));
+
+app.use("/gallery", (req, res, next) => { 
+    res.setHeader("Access-Control-Allow-Origin", "https://quantumquirksuoa.co.in"); 
+    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); 
+    next(); 
+}, express.static(path.join(__dirname, "public/gallery")));
+
+// ---------- Resend & OTP Setup ----------
+const resend = new Resend(process.env.RESEND_API_KEY);
+const EMAIL_FROM = process.env.EMAIL_FROM || "Quantum Quirks <onboarding@resend.dev>";
+const otpStore = new Map();
+const OTP_EXP_MINUTES = Number(process.env.OTP_EXP_MINUTES || 10);
+
+function createOTP(len = 6) { return Array.from({ length: len }, () => Math.floor(Math.random() * 10)).join(""); }
+function setOTP(email, code) { otpStore.set(email.toLowerCase(), { code, expiresAt: Date.now() + OTP_EXP_MINUTES * 60 * 1000, verified: false }); }
+function getOTP(email) { return otpStore.get((email || "").toLowerCase()); }
+function clearOTP(email) { otpStore.delete((email || "").toLowerCase()); }
+
+// ---------- Google Drive Setup ----------
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
+oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
+const drive = google.drive({ version: "v3", auth: oauth2Client });
+
+async function getOrCreateSubfolder(folderName, parentId) {
+  try {
+    const query = `mimeType='application/vnd.google-apps.folder' and name='${folderName.replace(/'/g, "\\'")}' and '${parentId}' in parents and trashed=false`;
+    const res = await drive.files.list({ q: query, fields: 'files(id, name)', spaces: 'drive' });
+    if (res.data.files.length > 0) return res.data.files[0].id;
+    const folder = await drive.files.create({ resource: { name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] }, fields: 'id' });
+    await drive.permissions.create({ fileId: folder.data.id, requestBody: { role: "reader", type: "anyone" } });
+    return folder.data.id;
+  } catch (err) { throw new Error("Failed to manage event folder"); }
+}
+
+async function uploadToGoogleDrive(fileBuffer, fileName, mimeType, folderName) {
+  try {
+    let targetFolderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
+    
+    // Check/Create Subfolder
+    if (folderName) targetFolderId = await getOrCreateSubfolder(folderName, targetFolderId);
+
+    // Create Stream
+    const bufferStream = new stream.PassThrough();
+    bufferStream.end(fileBuffer);
+
+    // Upload
+    const createResponse = await drive.files.create({
+      media: { mimeType: mimeType, body: bufferStream },
+      requestBody: { name: fileName, parents: [targetFolderId] },
+      fields: "id"
+    });
+
+    const fileId = createResponse.data.id;
+
+    // Set Permissions (Essential for the link to work)
+    await drive.permissions.create({
+      fileId: fileId,
+      requestBody: { role: "reader", type: "anyone" }
+    });
+
+    // --- THE FIX ---
+    // Instead of getting the thumbnailLink (which expires), we construct the permanent link.
+    const permanentUrl = `https://lh3.googleusercontent.com/d/${fileId}`;
+
+    return { publicUrl: permanentUrl, fileId };
+
+  } catch (error) {
+    console.error("Google Drive API Error:", error);
+    throw new Error("Failed to upload to Google Drive");
+  }
+}
+
+// ---------- Helpers ----------
+const nanoid = customAlphabet("1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ", 5);
+
+async function generateUniqueCode(client, eventId) {
+  for (let i = 0; i < 20; i++) {
+    const code = "TECH" + nanoid();
+    const res = await client.query("SELECT id FROM participants WHERE event_id=$1 AND code=$2", [eventId, code]);
+    if (res.rows.length === 0) return code;
+  }
+  throw new Error("Unable to generate unique participant code");
+}
+
+function signToken(payload) { return jwt.sign(payload, JWT_SECRET, { expiresIn: "8h" }); }
+
+function authMiddleware(req, res, next) {
+  const hdr = req.headers.authorization;
+  if (!hdr) return res.status(401).json({ ok: false, message: "Authorization required" });
+  try { const token = hdr.split(" ")[1]; req.user = jwt.verify(token, JWT_SECRET); next(); } catch (err) { return res.status(401).json({ ok: false, message: "Invalid token" }); }
+}
+
+function requireRole(role) { return (req, res, next) => { if (!req.user || req.user.role !== role) return res.status(403).json({ ok: false, message: "Forbidden" }); next(); }; }
+
+// ---------- DB Initialization ----------
 (async function initDb() {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS organizers (
-  id SERIAL PRIMARY KEY ,
-  name VARCHAR(100) NOT NULL,
-  email VARCHAR(150) UNIQUE NOT NULL,
-  phone VARCHAR(20) NOT NULL,
-  username VARCHAR(50) UNIQUE NOT NULL,
-  password VARCHAR(200) NOT NULL,
-  role VARCHAR(20) NOT NULL DEFAULT 'organizer',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS contact_messages (
-  id SERIAL PRIMARY KEY,
-  name VARCHAR(100) NOT NULL,
-  email VARCHAR(150) NOT NULL,
-  message TEXT NOT NULL,
-  created_at TIMESTAMP DEFAULT NOW()
-);
-
+        id SERIAL PRIMARY KEY ,
+        name VARCHAR(100) NOT NULL,
+        email VARCHAR(150) UNIQUE NOT NULL,
+        phone VARCHAR(20) NOT NULL,
+        username VARCHAR(50) UNIQUE NOT NULL,
+        password VARCHAR(200) NOT NULL,
+        role VARCHAR(20) NOT NULL DEFAULT 'organizer',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS contact_messages (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        email VARCHAR(150) NOT NULL,
+        message TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
       CREATE TABLE IF NOT EXISTS volunteers (
-    id SERIAL PRIMARY KEY,
-    vol_id VARCHAR(50) UNIQUE NOT NULL,
-    password_hash VARCHAR(200) NOT NULL,
-    name VARCHAR(100),
-    email VARCHAR(100),
-    phone VARCHAR(20),
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-
-
+        id SERIAL PRIMARY KEY,
+        vol_id VARCHAR(50) UNIQUE NOT NULL,
+        password_hash VARCHAR(200) NOT NULL,
+        name VARCHAR(100),
+        email VARCHAR(100),
+        phone VARCHAR(20),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
       CREATE TABLE IF NOT EXISTS events (
         id SERIAL PRIMARY KEY,
         slug VARCHAR(100) UNIQUE,
         name VARCHAR(200) NOT NULL,
-        entry_Amount INT NOT NULL,
+        entry_amount INT NOT NULL, 
         description TEXT,
         start_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         end_date TIMESTAMP NOT NULL
       );
-CREATE TABLE if not exists gallery_images (
-  id SERIAL PRIMARY KEY,
-  event_id INT REFERENCES events(id),
-  image_path TEXT NOT NULL,
-  description TEXT,
-  event_date DATE
-);
-
-
-
-
-CREATE TABLE IF NOT EXISTS participants (
-  id SERIAL PRIMARY KEY,
-  event_id INTEGER REFERENCES events(id) ON DELETE CASCADE,
-  name VARCHAR(200) NOT NULL,
-  batch VARCHAR(50) NOT NULL,
-  semester VARCHAR(50) NOT NULL,
-  father_name VARCHAR(200),
-  mother_name VARCHAR(200),
-  gender VARCHAR(20),
-  email VARCHAR(200) NOT NULL,
-  phone VARCHAR(20),
-  preferred_language VARCHAR(50) NOT NULL,
-  payment VARCHAR(20) DEFAULT 'unpaid',
-  code VARCHAR(16) UNIQUE, -- TECH####
-  payment_id VARCHAR(100),
-  order_id VARCHAR(100),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  CONSTRAINT uniq_email_event UNIQUE (event_id, email)
-);
-
-
+      CREATE TABLE if not exists gallery_images (
+        id SERIAL PRIMARY KEY,
+        event_id INT REFERENCES events(id),
+        image_path TEXT NOT NULL,
+        description TEXT,
+        event_date DATE,
+        drive_file_id VARCHAR(255)
+      );
+      CREATE TABLE IF NOT EXISTS participants (
+        id SERIAL PRIMARY KEY,
+        event_id INTEGER REFERENCES events(id) ON DELETE CASCADE,
+        name VARCHAR(200) NOT NULL,
+        batch VARCHAR(50) NOT NULL,
+        semester VARCHAR(50) NOT NULL,
+        father_name VARCHAR(200),
+        mother_name VARCHAR(200),
+        gender VARCHAR(20),
+        email VARCHAR(200) NOT NULL,
+        phone VARCHAR(20),
+        preferred_language VARCHAR(50) NOT NULL,
+        payment VARCHAR(20) DEFAULT 'unpaid',
+        transaction_id VARCHAR(100),
+        code VARCHAR(16) UNIQUE, 
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uniq_email_event UNIQUE (event_id, email)
+      );
       CREATE TABLE IF NOT EXISTS allocations (
         id SERIAL PRIMARY KEY,
         event_id INTEGER REFERENCES events(id) ON DELETE CASCADE,
@@ -106,7 +243,21 @@ CREATE TABLE IF NOT EXISTS participants (
         CONSTRAINT uniq_pc_per_event UNIQUE (event_id, pc_number),
         CONSTRAINT uniq_participant_alloc UNIQUE (participant_id)
       );
+      ALTER TABLE organizers ADD COLUMN IF NOT EXISTS last_password_reset TIMESTAMP DEFAULT (CURRENT_TIMESTAMP - INTERVAL '16 days');
+    
+    ALTER TABLE events ADD COLUMN IF NOT EXISTS allowed_languages TEXT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS participation_type VARCHAR(20) DEFAULT 'Solo';
+ALTER TABLE events ADD COLUMN IF NOT EXISTS max_group_size INT DEFAULT 1;
+      `);
+
+    await pool.query(`
+      DO $$ BEGIN 
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='participants' AND column_name='transaction_id') THEN 
+          ALTER TABLE participants ADD COLUMN transaction_id VARCHAR(100); 
+        END IF; 
+      END $$;
     `);
+
     console.log("✅ DB tables ensured");
   } catch (err) {
     console.error("DB init error:", err);
@@ -114,1188 +265,688 @@ CREATE TABLE IF NOT EXISTS participants (
   }
 })();
 
-// ---------- Express setup ----------
-const app = express();
-app.use(helmet());
-app.use(express.json());
-app.use(
-  cors({
-    origin: ["https://quantumquirksuoa.co.in", "https://quantumquirksuoa.netlify.app"],
-    credentials: true,
-  })
-);
+// ---------- 🎨 EMAIL TEMPLATES ----------
+// ---------- 🎨 ENHANCED EMAIL TEMPLATES ----------
 
-// ---------- Nodemailer ----------
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 465),
-  secure: process.env.SMTP_SECURE === "true" || Number(process.env.SMTP_PORT) === 465,
-  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-});
+// ---------- 🖨️ PDF GENERATOR HELPER ----------
+function generateTicketPDF(eventName, participantName, code, qrBuffer) {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({ size: 'A5', margin: 40 });
+      const buffers = [];
+      
+      doc.on('data', buffers.push.bind(buffers));
+      doc.on('end', () => resolve(Buffer.concat(buffers)));
 
-// ---------- OTP store ----------
-const otpStore = new Map(); // { email: { code, expiresAt, verified } }
-const OTP_EXP_MINUTES = Number(process.env.OTP_EXP_MINUTES || 10);
+      // Dark Header Background
+      doc.rect(0, 0, doc.page.width, 100).fill('#0d1117');
+      
+      // Title
+      doc.fillColor('#FFFFFF').fontSize(20).text("QUANTUM QUIRKS", 0, 40, { align: 'center' });
+      
+      // Ticket Details
+      doc.moveDown(4);
+      doc.fillColor('#000000');
+      
+      doc.fontSize(10).text("EVENT", { align: 'center' });
+      doc.fontSize(16).font('Helvetica-Bold').text(eventName, { align: 'center' });
+      doc.moveDown(1);
+      
+      doc.fontSize(10).font('Helvetica').text("PARTICIPANT", { align: 'center' });
+      doc.fontSize(14).font('Helvetica-Bold').text(participantName, { align: 'center' });
+      doc.moveDown(1);
 
-function createOTP(len = 6) {
-  return Array.from({ length: len }, () => Math.floor(Math.random() * 10)).join("");
-}
-function setOTP(email, code) {
-  otpStore.set(email.toLowerCase(), { code, expiresAt: Date.now() + OTP_EXP_MINUTES * 60 * 1000, verified: false });
-}
-function getOTP(email) {
-  return otpStore.get((email || "").toLowerCase());
-}
-function clearOTP(email) {
-  otpStore.delete((email || "").toLowerCase());
-}
+      doc.fontSize(10).font('Helvetica').text("TICKET CODE", { align: 'center' });
+      doc.fontSize(18).fillColor('#6366f1').font('Courier-Bold').text(code, { align: 'center' });
+      
+      doc.moveDown(1);
+      
+      // Draw QR Code Image (Centered)
+      const qrWidth = 150;
+      const x = (doc.page.width - qrWidth) / 2;
+      doc.image(qrBuffer, x, doc.y, { width: qrWidth });
+      
+      // Footer
+      doc.text("Present this QR code at the entrance.", x, doc.y + qrWidth + 10, { width: qrWidth, align: 'center', size: 8 });
 
-// ---------- Helpers ----------
-function generateEnrollCode() {
-  // returns 4 digit number as string, e.g. "3738"
-  return String(Math.floor(1000 + Math.random() * 9000));
-}
-
-/**
- * Generate a unique "TECH####" code for the given event.
- * This checks DB before returning. Retries up to maxAttempts.
- */
-// Generate unique code safely (outside transaction)
-import { customAlphabet } from "nanoid";
-
-// 5-char alphanumeric code
-const nanoid = customAlphabet("1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ", 5);
-
-async function generateUniqueCode(client, eventId) {
-  for (let i = 0; i < 20; i++) { // try 20 times
-    const code = "TECH" + nanoid();
-
-    const res = await client.query(
-      "SELECT id FROM participants WHERE event_id=$1 AND code=$2",
-      [eventId, code]
-    );
-
-    if (res.rows.length === 0) {
-      return code; // unique
+      doc.end();
+    } catch (err) {
+      reject(err);
     }
-    // else, collision, retry
-  }
-  throw new Error("Unable to generate unique participant code after multiple attempts");
+  });
 }
 
+// ---------- 🎨 UPDATED HTML TEMPLATE (Accepts CID) ----------
+const getTicketHtml = (eventName, participantName, code, cid) => {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <body style="margin:0; padding:0; background-color:#0d1117; font-family: 'Courier New', monospace;">
+    <table role="presentation" width="100%" style="background-color:#0d1117;">
+      <tr>
+        <td align="center" style="padding: 40px 10px;">
+          <table role="presentation" width="100%" style="max-width: 500px; background-color: #161b22; border: 1px solid #30363d; border-radius: 12px; overflow: hidden;">
+            <tr>
+              <td style="padding: 30px; text-align: center;">
+                <h1 style="color: #ffffff; margin: 0 0 10px 0;">ACCESS GRANTED</h1>
+                <h2 style="color: #58a6ff;">${eventName}</h2>
+                <div style="background-color: #ffffff; padding: 20px; border-radius: 8px; display: inline-block; margin: 20px auto;">
+                  <img src="cid:${cid}" alt="Ticket QR" width="200" height="200" style="display: block;" />
+                </div>
+                <p style="color: #c9d1d9; font-size: 16px; font-weight: bold; letter-spacing: 2px;">${code}</p>
+                <p style="color: #8b949e; font-size: 12px;">Participant: ${participantName}</p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+  </html>`;
+};
+
+// 2. PC ALLOCATION EMAIL (Matrix Green Theme)
+const getPcAllocationHtml = (eventName, participantName, pcNumber) => {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <body style="margin:0; padding:0; background-color:#000000; font-family: 'Courier New', monospace;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background-color:#000000;">
+      <tr>
+        <td align="center" style="padding: 40px 10px;">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width: 500px; border: 2px solid #00ff00; background-color: #0a0a0a; box-shadow: 0 0 20px rgba(0, 255, 0, 0.3);">
+            <tr>
+              <td style="padding: 30px; text-align: center;">
+                <h2 style="color: #00ff00; margin: 0 0 20px 0; letter-spacing: 2px; font-size: 18px; border-bottom: 1px solid #00ff00; padding-bottom: 15px;">
+                  >> SYSTEM_OVERRIDE
+                </h2>
+                
+                <p style="color: #ffffff; margin-bottom: 5px;">USER DETECTED: <strong>${participantName}</strong></p>
+                <p style="color: #008f00; font-size: 12px; margin-bottom: 30px;">TARGET: ${eventName}</p>
+
+                <div style="background-color: #001100; border: 1px dashed #00ff00; padding: 30px; margin-bottom: 30px;">
+                  <p style="color: #008f00; font-size: 10px; margin: 0; letter-spacing: 2px;">TERMINAL ASSIGNMENT</p>
+                  <h1 style="color: #ffffff; font-size: 64px; margin: 10px 0; text-shadow: 0 0 10px #00ff00;">${pcNumber}</h1>
+                </div>
+
+                <p style="color: #00ff00; font-size: 14px;">> PROCEED TO STATION IMMEDIATELY.</p>
+              </td>
+            </tr>
+            <tr>
+              <td style="background-color: #001100; padding: 10px; text-align: right; border-top: 1px solid #00ff00;">
+                <p style="color: #008f00; font-size: 10px; margin: 0;">TERMINAL_ALLOCATION_PROTOCOL // v2.0</p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+  </html>`;
+};
 
 
-// ---------- Auth / JWT ----------
-function signToken(payload) {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn: "8h" });
-}
-
-function authMiddleware(req, res, next) {
-  const hdr = req.headers.authorization;
-  if (!hdr) return res.status(401).json({ ok: false, message: "Authorization required" });
-  const parts = hdr.split(" ");
-  if (parts.length !== 2 || parts[0] !== "Bearer") return res.status(401).json({ ok: false, message: "Invalid auth header" });
-  try {
-    const data = jwt.verify(parts[1], JWT_SECRET);
-    req.user = data;
-    next();
-  } catch (err) {
-    return res.status(401).json({ ok: false, message: "Invalid token" });
-  }
-}
-
-function requireRole(role) {
-  return (req, res, next) => {
-    if (!req.user || req.user.role !== role) return res.status(403).json({ ok: false, message: "Forbidden: insufficient role" });
-    next();
-  };
-}
-
-// ---------- Validation Schemas ----------
-const enrollSchema = Joi.object({
-  name: Joi.string().min(2).max(120).required(),
-  batch: Joi.string().min(1).max(50).required(),
-  semester: Joi.string().min(1).max(50).required(),
-  fatherName: Joi.string().min(2).max(120).required(),
-  motherName: Joi.string().min(2).max(120).required(),
-  gender: Joi.string().valid("Male", "Female", "Other").required(),
-  email: Joi.string().email().required(),
-  phone: Joi.string().pattern(/^[0-9]{10,15}$/).required(),
-  preferredLanguage: Joi.string().min(1).max(50).required(),
-  eventId: Joi.number().integer().required(),
-});
-
-// ---------- Routes ----------
-
-// Health
-app.get("/api/health", (req, res) => res.json({ ok: true }));
-
-// ---------------- Check email availability ----------------
+// 2. CHECK EMAIL
 app.post("/api/check-email", async (req, res) => {
   const { email, eventId } = req.body;
-  if (!email || !eventId) return res.status(400).json({ ok: false, message: "Email & eventId required" });
-
   try {
-    const r = await pool.query(
-      "SELECT id FROM participants WHERE email=$1 AND event_id=$2",
-      [email, eventId]
-    );
-    if (r.rows.length > 0) {
-      return res.json({ ok: false, message: "Email already registered for this event" });
-    }
-    return res.json({ ok: true, message: "Email available" });
-  } catch (err) {
-    console.error("check-email err:", err);
-    return res.status(500).json({ ok: false, message: "Server error" });
-  }
+    const r = await pool.query("SELECT id FROM participants WHERE email=$1 AND event_id=$2", [email, eventId]);
+    if (r.rows.length > 0) return res.json({ ok: false, message: "Email already registered" });
+    return res.json({ ok: true });
+  } catch (err) { return res.status(500).json({ ok: false }); }
 });
 
-// ---------------- OTP ----------------
+// 3. OTP ROUTES
 app.post("/api/otp/:eventId/send", async (req, res) => {
   const { email, name } = req.body;
   if (!email) return res.status(400).json({ ok: false, message: "Email required" });
-
   const code = createOTP(6);
   setOTP(email, code);
-
   try {
-    await transporter.sendMail({
-      from: process.env.EMAIL_FROM || "Quantum Quirks <no-reply@Quantum Quirks.local>",
-      to: email,
-      subject: "Your Quantum Quirks OTP",
-      html: `<p>Hello ${name || ""},</p><p>Your OTP code is:</p><h2>${code}</h2><p>It expires in ${OTP_EXP_MINUTES} minutes.</p>`
-    });
+    await resend.emails.send({ from: EMAIL_FROM, to: email, subject: "Your Quantum Quirks OTP", html: `<p>Hello ${name || ""},</p><p>Your OTP code is:</p><h2>${code}</h2>` });
     return res.json({ ok: true, message: "OTP sent" });
-  } catch (err) {
-    console.error("send OTP err:", err);
-    return res.status(500).json({ ok: false, message: "Failed to send OTP" });
-  }
+  } catch (err) { return res.status(500).json({ ok: false }); }
 });
 
 app.post("/api/otp/:eventId/verify", (req, res) => {
   const { email, otp } = req.body;
-  if (!email || !otp) return res.status(400).json({ ok: false, message: "Email & OTP required" });
   const record = getOTP(email);
-  if (!record) return res.status(400).json({ ok: false, message: "OTP not found. Request again." });
-  if (Date.now() > record.expiresAt) {
-    clearOTP(email);
-    return res.status(400).json({ ok: false, message: "OTP expired" });
-  }
+  if (!record) return res.status(400).json({ ok: false, message: "OTP not found" });
+  if (Date.now() > record.expiresAt) { clearOTP(email); return res.status(400).json({ ok: false, message: "Expired" }); }
   if (record.code !== otp) return res.status(400).json({ ok: false, message: "Invalid OTP" });
-
   record.verified = true;
   otpStore.set(email.toLowerCase(), record);
-  return res.json({ ok: true, message: "Email verified" });
+  return res.json({ ok: true });
 });
 
-// ---------------- Public Enroll (participant) ----------------// make sure to install: npm i qrcode
-
-
-
-// import crypto from "crypto";
-// import Razorpay from "razorpay"
-
-
-// const RAZORPAY_KEY = process.env.RAZORPAY_KEY;
-// const RAZORPAY_SECRET = process.env.RAZORPAY_SECRET;
-
-// const razorpay = new Razorpay({
-//   key_id: RAZORPAY_KEY,
-//   key_secret: RAZORPAY_SECRET,
-// });
-
-// // -------------------- Create Razorpay Order --------------------
-// app.post("/api/payment/order", async (req, res) => {
-//   try {
-//     const { eventId, email, participant } = req.body;
-
-//     const eventRes = await pool.query(
-//       "SELECT entry_amount FROM events WHERE id = $1",
-//       [eventId]
-//     );
-//     if (!eventRes.rows.length) {
-//       return res.status(400).json({ ok: false, message: "Event not found" });
-//     }
-
-//     const entryAmount = eventRes.rows[0].entry_amount;
-
-//     const options = {
-//       amount: entryAmount * 100,
-//       currency: "INR",
-//       receipt: `receipt_${Date.now()}`,
-//       notes: { email, eventId, participant: JSON.stringify(participant) },
-//     };
-
-//     const order = await razorpay.orders.create(options);
-
-//     res.json({
-//       ok: true,
-//       orderId: order.id,
-//       amount: order.amount,
-//       currency: order.currency,
-//       key: RAZORPAY_KEY, // frontend ke liye
-//     });
-//   } catch (err) {
-//     console.error("Payment Order Error:", err);
-//     res.status(500).json({ ok: false, message: "Server error creating Razorpay order" });
-//   }
-// });
-
-// // -------------------- Handle Payment Success --------------------
-// app.post("/api/payment/success", async (req, res) => {
-//   try {
-//     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
-
-//     const body = razorpay_order_id + "|" + razorpay_payment_id;
-//     const expectedSignature = crypto
-//       .createHmac("sha256", RAZORPAY_SECRET)
-//       .update(body.toString())
-//       .digest("hex");
-
-//     if (expectedSignature !== razorpay_signature) {
-//       return res.status(400).json({ ok: false, message: "Invalid signature" });
-//     }
-
-//     const order = await razorpay.orders.fetch(razorpay_order_id);
-//     const { email, eventId, participant } = order.notes;
-//     const parsedParticipant = JSON.parse(participant);
-
-//     const enrollRes = await fetch("http://localhost:5000/api/participants/enroll", {
-//       method: "POST",
-//       headers: { "Content-Type": "application/json" },
-//       body: JSON.stringify({
-//         ...parsedParticipant,
-//         email,
-//         eventId,
-//         paymentId: razorpay_payment_id,
-//         orderId: razorpay_order_id,
-//         paymentMode: "Razorpay",
-//         txStatus: "SUCCESS",
-//         signature: razorpay_signature,
-//       }),
-//     });
-
-//     const enrollData = await enrollRes.json();
-
-//     if (enrollRes.ok && enrollData.ok) {
-//       return res.redirect(`/successful.html?code=${encodeURIComponent(enrollData.code)}`);
-//     } else {
-//       return res.redirect(`/failed.html?message=${encodeURIComponent(enrollData.message)}`);
-//     }
-//   } catch (err) {
-//     console.error("Payment success error:", err);
-//     res.status(500).send("Server error");
-//   }
-// });
-
-
-app.post("/api/participants/enroll", async (req, res) => {
+// 4. PARTICIPANT ENROLLMENT
+app.post("/api/participants/pre-enroll", async (req, res) => {
   try {
-    const { error, value } = enrollSchema.validate(req.body);
-    if (error) return res.status(400).json({ ok: false, message: error.message });
+    let { email, eventId } = req.body;
+    eventId = Number(eventId);
+    if (!eventId || isNaN(eventId)) return res.status(400).json({ ok: false, message: "Invalid Event ID detected." });
 
-    const { email, eventId } = value;
-
-    // ✅ OTP check
     const otpRec = getOTP(email);
-    if (!otpRec || !otpRec.verified) {
-      return res.status(400).json({ ok: false, message: "Please verify your email first." });
-    }
+    if (!otpRec || !otpRec.verified) return res.status(400).json({ ok: false, message: "Email not verified" });
 
-    // ✅ Fetch event details
-    const ev = await pool.query("SELECT id, name FROM events WHERE id=$1", [eventId]);
-    if (ev.rows.length === 0) {
-      return res.status(404).json({ ok: false, message: "Event not found" });
+    const dup = await pool.query("SELECT id FROM participants WHERE event_id=$1 AND email=$2", [eventId, email]);
+    if (dup.rows.length > 0) return res.status(400).json({ ok: false, message: "Email already registered for this event" });
+
+    const ev = await pool.query("SELECT id, name, entry_amount FROM events WHERE id=$1", [eventId]);
+    if (ev.rows.length === 0) return res.status(404).json({ ok: false, message: "Event not found" });
+    
+    // REPLACE THIS with your actual UPI ID
+    const MY_UPI_ID = process.env.UPI_ID; 
+
+    if (ev.rows[0].entry_amount > 0) {
+      return res.json({ ok: true, requiresPayment: true, amount: ev.rows[0].entry_amount, eventName: ev.rows[0].name, upiId: MY_UPI_ID, message: "Scan QR to pay." });
+    } else {
+      return res.json({ ok: true, requiresPayment: false, message: "Free event." });
     }
+  } catch (err) { console.error("Pre-enroll error:", err); res.status(500).json({ ok: false, message: "Server validation failed" }); }
+});
+
+// ... existing imports ...
+
+// 4. CONFIRM ENROLL (UPDATED FOR QR & PDF)
+app.post("/api/participants/confirm-enroll", async (req, res) => {
+  try {
+    let { name, email, eventId, transactionId, ...otherFields } = req.body;
+    eventId = Number(eventId);
+    const otpRec = getOTP(email);
+    if (!otpRec?.verified) return res.status(400).json({ ok: false, message: "Session expired." });
+
+    const ev = await pool.query("SELECT id, name, entry_amount, slug FROM events WHERE id=$1", [eventId]);
     const event = ev.rows[0];
+    let status = event.entry_amount > 0 ? 'pending_verification' : 'paid';
 
-    // ✅ Check duplicate registration
-    const dup = await pool.query(
-      "SELECT id FROM participants WHERE event_id=$1 AND email=$2",
-      [eventId, email]
-    );
-    if (dup.rows.length > 0) {
-      return res.status(400).json({ ok: false, message: "Email already registered for this event" });
-    }
-
-    // ✅ Insert participant
     const client = await pool.connect();
     let finalCode = null;
     try {
       await client.query("BEGIN");
       finalCode = await generateUniqueCode(client, eventId);
-
       await client.query(
-        `INSERT INTO participants
-          (event_id, name, batch, semester, father_name, mother_name, gender, email, phone, preferred_language, code, payment)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'pending')`, // payment = pending
-        [
-          eventId,
-          value.name,
-          value.batch,
-          value.semester,
-          value.fatherName,
-          value.motherName,
-          value.gender,
-          value.email,
-          value.phone,
-          value.preferredLanguage,
-          finalCode
-        ]
+        `INSERT INTO participants (event_id, name, email, payment, transaction_id, code, batch, semester, father_name, mother_name, gender, phone, preferred_language) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        [eventId, name, email, status, transactionId || null, finalCode, otherFields.batch, otherFields.semester, otherFields.fatherName, otherFields.motherName, otherFields.gender, otherFields.phone, otherFields.preferredLanguage]
       );
-
       await client.query("COMMIT");
-    } catch (err) {
-      await client.query("ROLLBACK");
-      console.error("Enroll transaction err:", err);
-      return res.status(500).json({ ok: false, message: "Enrollment failed" });
-    } finally {
-      client.release();
-    }
+    } catch (err) { await client.query("ROLLBACK"); throw err; } finally { client.release(); }
 
-    // ✅ Generate QR Code
-    const qrBuffer = await QRCode.toBuffer(finalCode, {
-      type: "png",
-      width: 200,
-      margin: 2,
-      color: { dark: "#000000", light: "#ffffff" },
-    });
+    if (status === 'paid') {
+      // 1. Generate QR Buffer (Raw Image)
+      const qrBuffer = await QRCode.toBuffer(finalCode, { color: { dark: '#000000', light: '#ffffff' }, width: 300, margin: 1 });
+      
+      // 2. Generate PDF Buffer (Pass QR Buffer to it)
+      const pdfBuffer = await generateTicketPDF(event.name, name, finalCode, qrBuffer);
+      
+      // 3. Define a Content-ID
+      const qrCid = "ticket_qr_image_unique";
 
-    // ✅ Send confirmation email
-    try {
-      await transporter.sendMail({
-        from: process.env.EMAIL_FROM || "Quantum Quirks <no-reply@quantumquirks.local>",
-        to: email,
-        subject: `Enrollment Confirmed - ${event.name}`,
-        html:`<table align="center" border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width:400px; font-family: Arial, sans-serif; background:#ffffff; border-radius:8px; overflow:hidden;">
-  
-  <!-- Header -->
-  <tr>
-    <td align="center" bgcolor="#4f46e5" style="padding:20px; color:#ffffff;">
-      <h1 style="margin:0; font-size:24px;">Quantum Quirks</h1>
-      <h2 style="margin:5px 0; font-size:18px; font-weight:normal;">Enrollment Confirmed</h2>
-    </td>
-  </tr>
-
-  <!-- Event Details -->
-  <tr>
-    <td style="padding:20px; font-size:14px; line-height:20px; color:#333333; border-bottom:1px solid #eeeeee;">
-      <h3 style="margin-bottom:10px; color:#4f46e5; font-size:16px; text-align:center;">Event Details</h3>
-      <p style="text-align:center;"><b>Event:</b> ${event.name}</p>
-      <p style="text-align:center;"><b>Participant:</b> ${value.name}</p>
-      <p style="text-align:center;"><b>Email:</b> ${value.email}</p>
-      <p style="text-align:center;"><b>Phone:</b> ${value.phone}</p>
-    </td>
-  </tr>
-
-  <!-- Code & QR -->
-  <tr>
-    <td align="center" style="padding:20px; font-size:14px; color:#333333; border-bottom:1px solid #eeeeee;">
-      <h3 style="margin-bottom:10px; color:#4f46e5; font-size:16px;">Your Code</h3>
-      <p style="font-size:20px; font-weight:bold; color:#111111; margin:0;">${finalCode}</p>
-      <img src="cid:qrCodeImage" alt="QR Code" width="150" height="150" style="margin-top:10px; display:block; margin-left:auto; margin-right:auto;" />
-    </td>
-  </tr>
-
-  <!-- Footer -->
-  <tr>
-    <td align="center" bgcolor="#f9fafb" style="padding:15px; font-size:12px; color:#555555;">
-      Thank you for enrolling in <b>${event.name}</b>!<br>
-      Please keep this email safe and show your QR code or unique code at the event entrance.
-    </td>
-  </tr>
-
-</table>
-`,
-        attachments: [{ filename: "qrcode.png", content: qrBuffer, cid: "qrCodeImage" }],
+      // 4. Send Email with Inline Image + PDF Attachment
+      await resend.emails.send({
+        from: EMAIL_FROM, 
+        to: email, 
+        subject: `[ACCESS GRANTED] Ticket for ${event.name}`,
+        html: getTicketHtml(event.name, name, finalCode, qrCid), // Reference CID here
+        attachments: [
+            {
+                filename: 'ticket-qr.png',
+                content: qrBuffer,
+                cid: qrCid // This ensures it shows in the email body
+            },
+            {
+                filename: `${event.slug || 'ticket'}.pdf`,
+                content: pdfBuffer // This is the downloadable PDF
+            }
+        ]
       });
-    } catch (mailErr) {
-      console.warn("Email send after enroll failed:", mailErr);
+    } else {
+      await resend.emails.send({ from: EMAIL_FROM, to: email, subject: "Payment Pending", html: "<p>Verification in progress...</p>" });
     }
 
     clearOTP(email);
-    return res.json({ ok: true, message: "Enrollment success", code: finalCode });
-  } catch (err) {
-    console.error("Enroll err:", err);
-    return res.status(500).json({ ok: false, message: "Server error" });
-  }
+    return res.json({ ok: true, message: "Success!", status });
+  } catch (err) { console.error("Confirm error:", err); res.status(500).json({ ok: false, message: err.message }); }
 });
 
+// 5. APPROVE PAYMENT (UPDATED FOR QR & PDF)
+app.post("/api/organizer/approve-payment", authMiddleware, requireRole("organizer"), async (req, res) => {
+  try {
+    const result = await pool.query("UPDATE participants SET payment='paid' WHERE id=$1 RETURNING *", [req.body.participantId]);
+    if (result.rows.length === 0) return res.status(404).json({ ok: false });
+    const user = result.rows[0];
+    const evRes = await pool.query("SELECT name, slug FROM events WHERE id=$1", [user.event_id]);
+    const event = evRes.rows[0];
 
+    // Generate Buffers
+    const qrBuffer = await QRCode.toBuffer(user.code, { color: { dark: '#000000', light: '#ffffff' }, width: 300, margin: 1 });
+    const pdfBuffer = await generateTicketPDF(event.name, user.name, user.code, qrBuffer);
+    const qrCid = "ticket_qr_image_unique";
 
+    await resend.emails.send({
+      from: EMAIL_FROM, 
+      to: user.email, 
+      subject: `[CONFIRMED] Ticket for ${event.name}`,
+      html: getTicketHtml(event.name, user.name, user.code, qrCid),
+      attachments: [
+        { filename: 'ticket-qr.png', content: qrBuffer, cid: qrCid },
+        { filename: `${event.slug}.pdf`, content: pdfBuffer }
+      ]
+    });
 
-// ---------------- Organizer & Volunteer login ----------------
+    res.json({ ok: true, message: "Approved & Ticket Sent" });
+  } catch (err) { res.status(500).json({ ok: false }); }
+});
+// 5. STANDARD LOGINS
 app.post("/api/organizer/login", async (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password || username.length !== 8) return res.status(400).json({ ok: false, message: "Provide valid 8-char username and password" });
-
   try {
     const r = await pool.query("SELECT id, password FROM organizers WHERE username=$1", [username]);
-    if (r.rows.length === 0) return res.status(401).json({ ok: false, message: "Invalid credentials" });
-    const row = r.rows[0];
-    const ok = await bcrypt.compare(password, row.password);
-    if (!ok) return res.status(401).json({ ok: false, message: "Invalid credentials" });
-
-    const token = signToken({ id: row.id, username, role: "organizer" });
-    return res.json({ ok: true, role: "organizer", token });
-  } catch (err) {
-    console.error("organizer login err:", err);
-    return res.status(500).json({ ok: false, message: "Server error" });
-  }
+    if (r.rows.length === 0) return res.status(401).json({ ok: false });
+    if (await bcrypt.compare(password, r.rows[0].password)) {
+      return res.json({ ok: true, token: signToken({ id: r.rows[0].id, username, role: "organizer" }) });
+    }
+    res.status(401).json({ ok: false });
+  } catch (err) { res.status(500).json({ ok: false }); }
 });
 
 app.post("/api/volunteer/login", async (req, res) => {
   const { volId, password } = req.body;
-  if (!volId || !password || volId.length !== 6) return res.status(400).json({ ok: false, message: "Provide valid 6-char volunteer id & password" });
-
   try {
     const r = await pool.query("SELECT id, password_hash FROM volunteers WHERE vol_id=$1", [volId]);
-    if (r.rows.length === 0) return res.status(401).json({ ok: false, message: "Invalid credentials" });
-    const row = r.rows[0];
-    const ok = await bcrypt.compare(password, row.password_hash);
-    if (!ok) return res.status(401).json({ ok: false, message: "Invalid credentials" });
-
-    const token = signToken({ id: row.id, volId, role: "volunteer" });
-    return res.json({ ok: true, role: "volunteer", token });
-  } catch (err) {
-    console.error("vol login err:", err);
-    return res.status(500).json({ ok: false, message: "Server error" });
-  }
+    if (r.rows.length === 0) return res.status(401).json({ ok: false });
+    if (await bcrypt.compare(password, r.rows[0].password_hash)) {
+      return res.json({ ok: true, token: signToken({ id: r.rows[0].id, volId, role: "volunteer" }) });
+    }
+    res.status(401).json({ ok: false });
+  } catch (err) { res.status(500).json({ ok: false }); }
 });
 
-// ---------------- Events (organizer) ----------------
+// 6. EVENTS MANAGEMENT
 app.post("/api/events", authMiddleware, requireRole("organizer"), async (req, res) => {
-  const { name, amount, description, endDate } = req.body;
-  if (!name || !endDate) return res.status(400).json({ ok: false, message: "name & endDate required" });
-
+  const { name, amount, description, endDate, languages, type, groupSize } = req.body;
   try {
     const slug = name.toLowerCase().replace(/\s+/g, "-").slice(0, 80);
+    
+    // Ensure languages is stored as a comma-separated string
+    const langString = Array.isArray(languages) ? languages.join(',') : (languages || "");
 
-    // 👇 corrected column name entry_amount
     const r = await pool.query(
-      "INSERT INTO events (slug, name, entry_Amount, description, end_date) VALUES ($1,$2,$3,$4,$5) RETURNING *",
-      [slug, name, amount, description || "", endDate]
+      `INSERT INTO events (slug, name, entry_amount, description, end_date, allowed_languages, participation_type, max_group_size) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`, 
+      [slug, name, amount, description || "", endDate, langString, type || "Solo", groupSize || 1]
     );
-
-    return res.json({ ok: true, event: r.rows[0] });
-  } catch (err) {
-    console.error("create event err:", err);
-    return res.status(500).json({ ok: false, message: "Failed to create event" });
-  }
-});
-
-app.get("/contacts", authMiddleware, async (req, res) => {
-  try {
-    if (req.user.role !== "organizer") {
-      return res.status(403).json({ ok: false, message: "Access denied" });
-    }
-
-    const result = await pool.query(
-      "SELECT id, name, email, message, created_at FROM contact_messages ORDER BY created_at DESC"
-    );
-
-    res.json({ ok: true, contacts: result.rows });
-  } catch (err) {
-    console.error("Error fetching contacts:", err);
-    res.status(500).json({ ok: false, message: "Server error" });
-  }
-});
-
-// Delete a contact by ID
-app.delete("/contacts/:id", authMiddleware, async (req, res) => {
-  try {
-    if (req.user.role !== "organizer") {
-      return res.status(403).json({ ok: false, message: "Access denied" });
-    }
-
-    const { id } = req.params;
-    await pool.query("DELETE FROM contact_messages WHERE id=$1", [id]);
-
-    res.json({ ok: true, message: "Contact deleted" });
-  } catch (err) {
-    console.error("Error deleting contact:", err);
-    res.status(500).json({ ok: false, message: "Server error" });
+    res.json({ ok: true, event: r.rows[0] });
+  } catch (err) { 
+    console.error("Create Event Error:", err);
+    res.status(500).json({ ok: false, message: "Failed to create event" }); 
   }
 });
 
 app.get("/api/events", async (req, res) => {
-  try {
-    const r = await pool.query("SELECT * FROM events ORDER BY start_date DESC");
-    return res.json({ ok: true, events: r.rows });
-  } catch (err) {
-    console.error("get events err:", err);
-    return res.status(500).json({ ok: false, message: "Failed to fetch events" });
+  try { 
+    const r = await pool.query("SELECT * FROM events ORDER BY start_date DESC"); 
+    res.json({ ok: true, events: r.rows }); 
+  } catch (err) { 
+    res.status(500).json({ ok: false }); 
   }
 });
 
-// (remaining routes unchanged - allocations, organizer participant endpoints etc.)
-// For brevity I assume the rest of your file remains as previously (allocations, verify-code, organizer allocate, seed user, etc.)
-// If you'd like, I can paste the remainder with the same allocation logic you had.
+app.delete("/api/events/:id", authMiddleware, requireRole("organizer"), async (req, res) => {
+  try {
+    const eventId = Number(req.params.id);
+    await pool.query("DELETE FROM participants WHERE event_id = $1", [eventId]);
+    await pool.query("DELETE FROM events WHERE id = $1", [eventId]);
+    res.json({ ok: true, message: "Event Deleted" });
+  } catch (err) { 
+    res.status(500).json({ ok: false, message: "Failed to delete event" }); 
+  }
+});
 
+// 7. PARTICIPANT MANAGEMENT
+app.post("/api/organizer/participant", authMiddleware, requireRole("organizer"), async (req, res) => {
+  const { eventId, name, fatherName, motherName, gender, email, phone, preferredLanguage } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const code = await generateUniqueCode(client, eventId);
+    const insert = await client.query(`INSERT INTO participants (event_id, name, father_name, mother_name, gender, email, phone, preferred_language, code) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`, [eventId, name, fatherName, motherName, gender, email, phone, preferredLanguage, code]);
+    await client.query("COMMIT");
+    res.json({ ok: true, participant: insert.rows[0] });
+  } catch (err) { await client.query("ROLLBACK"); res.status(500).json({ ok: false }); } finally { client.release(); }
+});
 
+app.get("/api/events/:id/participants", authMiddleware, async (req, res) => {
+  try { const r = await pool.query("SELECT * FROM participants WHERE event_id=$1 ORDER BY id DESC", [req.params.id]); res.json({ ok: true, participants: r.rows }); } catch (err) { res.status(500).json({ ok: false }); }
+});
 
+app.delete("/api/participants/:id", authMiddleware, requireRole("organizer"), async (req, res) => {
+  try { await pool.query("DELETE FROM participants WHERE id = $1", [req.params.id]); res.json({ ok: true, message: "Participant Deleted" }); } catch (err) { res.status(500).json({ ok: false, message: "Failed to delete participant" }); }
+});
 
-
-// POST /api/organizer/volunteer
+// 8. STAFF MANAGEMENT
 app.post("/api/organizer/volunteer", authMiddleware, requireRole("organizer"), async (req, res) => {
   try {
     const { name, email, phone, username, password } = req.body;
-
-    if (!name || !email || !phone || !username || !password)
-      return res.status(400).json({ ok: false, message: "All fields are required" });
-
-    // Validate email
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email))
-      return res.status(400).json({ ok: false, message: "Invalid email format" });
-
-    // Check if volunteer already exists
-    const existing = await pool.query("SELECT * FROM volunteers WHERE vol_id=$1", [username]);
-    if (existing.rows.length > 0)
-      return res.status(400).json({ ok: false, message: "Volunteer already registered" });
-
-    // Hash password
     const hashed = await bcrypt.hash(password, 10);
-
-    // Insert into DB
-    const result = await pool.query(
-      `INSERT INTO volunteers (vol_id, password_hash, name, email, phone) 
-       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [username, hashed, name, email, phone]
-    );
-
-    console.log("Sending email to:", email);
-
-    // Send welcome email
-    await transporter.sendMail({
-      from: process.env.EMAIL_FROM || "Quantum Quirks <no-reply@Quantum Quirks.local>",
-      to: email,
-      subject: "Welcome to Quantum Quirks! 🎉",
-      html: `
-        <h2>Hello, ${name}!</h2>
-        <p>Welcome aboard as a volunteer for our Quantum Quirks event.</p>
-        <p>Here are your credentials:</p>
-        <ul>
-          <li><b>Volunteer ID / Username:</b> ${username}</li>
-          <li><b>Email:</b> ${email}</li>
-          <li><b>Password:</b> ${password}</li>
-        </ul>
-        <p>Please <b>keep this information safe</b> and log in to the volunteer dashboard to start managing participants.</p>
-        <p>We are excited to have you with us! 🚀</p>
-        <p>— <i>Quantum Quirks Team</i></p>
-      `
-    });
-
-    res.json({ ok: true, volunteer: result.rows[0], message: "Volunteer added and email sent!" });
-
-  } catch (err) {
-    console.error("Volunteer route error:", err);
-    res.status(500).json({ ok: false, message: "Server error" });
-  }
+    const result = await pool.query(`INSERT INTO volunteers (vol_id, password_hash, name, email, phone) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [username, hashed, name, email, phone]);
+    res.json({ ok: true, volunteer: result.rows[0] });
+  } catch (err) { res.status(500).json({ ok: false, message: "Failed to add volunteer" }); }
 });
 
-
-// Add Organizer (Admin only)
 app.post("/api/admin/organizer", authMiddleware, requireRole("organizer"), async (req, res) => {
-  const { name, email, phone, username, password } = req.body;
-
-  if(!name || !email || !phone || !username || !password){
-    return res.status(400).json({ ok: false, message: "All fields required" });
-  }
-  if(username.length !== 8){
-    return res.status(400).json({ ok: false, message: "Username must be 8 characters" });
-  }
-
   try {
-    // hash password
+    const { name, email, phone, username, password } = req.body;
     const hashed = await bcrypt.hash(password, 10);
-
-    // check for duplicates
-    const dup = await pool.query("SELECT id FROM organizers WHERE username=$1 OR email=$2", [username, email]);
-    if(dup.rows.length > 0){
-      return res.status(400).json({ ok: false, message: "Username or Email already exists" });
-    }
-
-    // insert organizer
-    const insert = await pool.query(
-      `INSERT INTO organizers (name, email, phone, username, password, role) 
-       VALUES ($1,$2,$3,$4,$5,'organizer') RETURNING id, name, email, username, role`,
-      [name, email, phone, username, hashed]
-    );
-
-    console.log("Sending organizer email to:", email);
-
-    // send styled HTML email
-    await transporter.sendMail({
-      from: process.env.EMAIL_FROM || "Quantum Quarks <no-reply@quantumquarks.com>",
-      to: email,
-      subject: "You have been added as Organizer 🎉",
-      html: `
-        <div style="font-family: Arial, sans-serif; background: #f9f9f9; padding: 20px;">
-          <div style="max-width: 600px; margin: auto; background: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.1);">
-            <h2 style="color: #4f46e5; text-align: center;">Welcome to Quantum Quarks 🚀</h2>
-            <p>Hello <b>${name}</b>,</p>
-            <p>We are excited to inform you that you have been added as an <b>Organizer</b> for our event.</p>
-            <p>Here are your login credentials:</p>
-            <table style="width: 100%; border-collapse: collapse; margin: 15px 0;">
-              <tr><td style="padding: 8px; border: 1px solid #ddd;"><b>Username</b></td><td style="padding: 8px; border: 1px solid #ddd;">${username}</td></tr>
-              <tr><td style="padding: 8px; border: 1px solid #ddd;"><b>Email</b></td><td style="padding: 8px; border: 1px solid #ddd;">${email}</td></tr>
-              <tr><td style="padding: 8px; border: 1px solid #ddd;"><b>Password</b></td><td style="padding: 8px; border: 1px solid #ddd;">${password}</td></tr>
-            </table>
-            <p style="color: #d32f2f;">⚠️ Please keep this information safe and do not share it with anyone.</p>
-            <p>You can now log in to your organizer dashboard and start managing events and participants.</p>
-            <p style="margin-top: 20px;">Best regards,<br/><i>The Quantum Quarks Team</i></p>
-          </div>
-        </div>
-      `
-    });
-
-    return res.json({ ok: true, organizer: insert.rows[0], message: "Organizer added and email sent!" });
-
-  } catch(err) {
-    console.error("add organizer error:", err);
-    res.status(500).json({ ok: false, message: "Failed to add organizer" });
-  }
+    const result = await pool.query(`INSERT INTO organizers (name, email, phone, username, password, role) VALUES ($1,$2,$3,$4,$5,'organizer') RETURNING *`, [name, email, phone, username, hashed]);
+    res.json({ ok: true, organizer: result.rows[0] });
+  } catch (err) { res.status(500).json({ ok: false, message: "Failed to add organizer" }); }
 });
 
-
-// ---------------- Events (organizer) ----------------
-app.post("/api/events", authMiddleware, requireRole("organizer"), async (req, res) => {
-  const { name, description, endDate } = req.body;
-  if (!name || !endDate) return res.status(400).json({ ok: false, message: "name & endDate required" });
-
-  try {
-    const slug = name.toLowerCase().replace(/\s+/g, "-").slice(0, 80);
-    const r = await pool.query("INSERT INTO events (slug, name, description, end_date) VALUES ($1,$2,$3,$4) RETURNING *", [slug, name, description || "", endDate]);
-    return res.json({ ok: true, event: r.rows[0] });
-  } catch (err) {
-    console.error("create event err:", err);
-    return res.status(500).json({ ok: false, message: "Failed to create event" });
-  }
-});
-
-app.get("/api/events", async (req, res) => {
-  try {
-    const r = await pool.query("SELECT * FROM events ORDER BY start_date DESC");
-    return res.json({ ok: true, events: r.rows });
-  } catch (err) {
-    console.error("get events err:", err);
-    return res.status(500).json({ ok: false, message: "Failed to fetch events" });
-  }
-});
-
-// ---------------- Organizer: add / edit participant ----------------
-app.post("/api/organizer/participant", authMiddleware, requireRole("organizer"), async (req, res) => {
-  const schema = Joi.object({
-    eventId: Joi.number().integer().required(),
-    name: Joi.string().min(2).required(),
-    fatherName: Joi.string().allow("", null),
-    motherName: Joi.string().allow("", null),
-    gender: Joi.string().valid("Male", "Female", "Other").required(),
-    email: Joi.string().email().required(),
-    phone: Joi.string().required(),
-    preferredLanguage: Joi.string().required()
-  });
-  const { error, value } = schema.validate(req.body);
-  if (error) return res.status(400).json({ ok: false, message: error.message });
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const ev = await client.query("SELECT id FROM events WHERE id=$1", [value.eventId]);
-    if (ev.rows.length === 0) { await client.query("ROLLBACK"); return res.status(404).json({ ok: false, message: "Event not found" }); }
-
-    const dup = await client.query("SELECT id FROM participants WHERE event_id=$1 AND email=$2", [value.eventId, value.email]);
-    if (dup.rows.length > 0) { await client.query("ROLLBACK"); return res.status(400).json({ ok: false, message: "Email already registered for event" }); }
-
-    // generate unique code
-    const code = await generateUniqueCode(client,value.eventId);
-
-    const insert = await client.query(
-      `INSERT INTO participants (event_id, name, father_name, mother_name, gender, email, phone, preferred_language, code)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [value.eventId, value.name, value.fatherName, value.motherName, value.gender, value.email, value.phone, value.preferredLanguage, code]
-    );
-    await client.query("COMMIT");
-
-    // send confirmation mail
-    try {
-      await transporter.sendMail({
-        from: process.env.EMAIL_FROM || "Quantum Quirks <no-reply@Quantum Quirks.local>",
-        to: value.email,
-        subject: "You were added to Quantum Quirks by Organizer",
-        html: `<p>Hello ${value.name},</p><p>You were added to event. Your code: <b>${code}</b></p>`
-      });
-    } catch (mailErr) { console.warn("organizer add participant mail failed", mailErr); }
-
-    return res.json({ ok: true, participant: insert.rows[0] });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    
-    console.error("organizer add participant err:", err);
-    return res.status(500).json({ ok: false, message: "Failed to add participant" });
-  } finally {
-    client.release();
-  }
-});
-
-app.put("/api/organizer/participant/:id", authMiddleware, requireRole("organizer"), async (req, res) => {
-  const id = Number(req.params.id);
-  const { name, fatherName, motherName, gender, phone, preferredLanguage } = req.body;
-  try {
-    const r = await pool.query(
-      `UPDATE participants SET name=$1, father_name=$2, mother_name=$3, gender=$4, phone=$5, preferred_language=$6 WHERE id=$7 RETURNING *`,
-      [name, fatherName, motherName, gender, phone, preferredLanguage, id]
-    );
-    if (r.rows.length === 0) return res.status(404).json({ ok: false, message: "Participant not found" });
-    return res.json({ ok: true, participant: r.rows[0] });
-  } catch (err) {
-    if (err.code === "23505") return res.status(400).json({ ok: false, message: "Preferred language conflict" });
-    console.error("edit participant err:", err);
-    return res.status(500).json({ ok: false, message: "Failed to edit participant" });
-  }
-});
-
-// ---------------- List participants (event wise) ----------------
-app.get("/api/events/:id/participants", authMiddleware, async (req, res) => {
-  const eventId = Number(req.params.id);
-  try {
-    const r = await pool.query("SELECT * FROM participants WHERE event_id=$1 ORDER BY id DESC", [eventId]);
-    return res.json({ ok: true, participants: r.rows });
-  } catch (err) {
-    console.error("list participants err:", err);
-    return res.status(500).json({ ok: false, message: "Failed to fetch participants" });
-  }
-});
-
-// ---------------- Allocation (verify code and allocate PC) -----------
-// ---------------- Allocation (verify code and allocate PC) -----------
-
-// 🔹 Updated allocation: ensure no adjacent participants have same language
+// 9. ALLOCATION
 async function allocatePcForParticipant(client, participantId, eventId) {
-  // check if already allocated
-  const existing = await client.query(
-    "SELECT pc_number FROM allocations WHERE participant_id=$1",
-    [participantId]
-  );
+  const existing = await client.query("SELECT pc_number FROM allocations WHERE participant_id=$1", [participantId]);
   if (existing.rows.length > 0) return existing.rows[0].pc_number;
-
-  // get participant's language
-  const langRes = await client.query(
-    "SELECT preferred_language FROM participants WHERE id=$1",
-    [participantId]
-  );
-  if (langRes.rows.length === 0) throw new Error("Participant not found for allocation");
+  const langRes = await client.query("SELECT preferred_language FROM participants WHERE id=$1", [participantId]);
   const myLang = langRes.rows[0].preferred_language;
-
-  // get all allocations for this event
-  const usedRes = await client.query(
-    `SELECT a.pc_number, p.preferred_language
-     FROM allocations a
-     JOIN participants p ON a.participant_id = p.id
-     WHERE a.event_id=$1
-     ORDER BY a.pc_number ASC`,
-    [eventId]
-  );
-
+  const usedRes = await client.query(`SELECT a.pc_number, p.preferred_language FROM allocations a JOIN participants p ON a.participant_id = p.id WHERE a.event_id=$1 ORDER BY a.pc_number ASC`, [eventId]);
   const used = usedRes.rows;
-
   let pc = 1;
-  while (true) {
-    // check if pc already taken
-    if (used.find(u => u.pc_number === pc)) {
-      pc++;
-      continue;
-    }
-
-    // check neighbor languages
-    const left = used.find(u => u.pc_number === pc - 1);
-    const right = used.find(u => u.pc_number === pc + 1);
-
-    if ((left && left.preferred_language === myLang) ||
-        (right && right.preferred_language === myLang)) {
-      // skip this pc and try next
-      pc++;
-      continue;
-    }
-
-    // ✅ Found valid PC
+  while(true){
+    if(used.find(u => u.pc_number === pc)) { pc++; continue; }
+    const left = used.find(u => u.pc_number === pc-1);
+    const right = used.find(u => u.pc_number === pc+1);
+    if((left && left.preferred_language === myLang) || (right && right.preferred_language === myLang)) { pc++; continue; }
     break;
   }
-
-  await client.query(
-    "INSERT INTO allocations (event_id, participant_id, pc_number) VALUES ($1,$2,$3)",
-    [eventId, participantId, pc]
-  );
-
+  await client.query("INSERT INTO allocations (event_id, participant_id, pc_number) VALUES ($1,$2,$3)", [eventId, participantId, pc]);
   return pc;
 }
 
+app.post("/api/organizer/allocate", authMiddleware, requireRole("organizer"), async (req, res) => {
+  const { participantId } = req.body;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Fetch name & email for email
+    const p = await client.query("SELECT id, event_id, name, email FROM participants WHERE id=$1 FOR UPDATE", [participantId]);
+    if (p.rows.length === 0) { await client.query("ROLLBACK"); return res.status(404).json({ ok: false }); }
+    
+    const user = p.rows[0];
+    const pc = await allocatePcForParticipant(client, user.id, user.event_id);
+    
+    // Get Event Name
+    const ev = await client.query("SELECT name FROM events WHERE id=$1", [user.event_id]);
+    const eventName = ev.rows[0].name;
+
+    await client.query("COMMIT");
+
+    // Send "Matrix" Email
+    await resend.emails.send({
+      from: EMAIL_FROM, to: user.email, subject: `[TERMINAL ASSIGNED] ${eventName}`,
+      html: getPcAllocationHtml(eventName, user.name, `PC-${pc}`)
+    });
+
+    res.json({ ok: true, pc });
+  } catch (e) { await client.query("ROLLBACK"); console.error(e); res.status(500).json({ ok: false }); } finally { client.release(); }
+});
 
 app.post("/api/verify-code", authMiddleware, async (req, res) => {
   const { code } = req.body;
-  if (!code) return res.status(400).json({ ok: false, message: "code required" });
-
+  if (!code) return res.status(400).json({ ok: false, message: "Code required" });
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
-
-    // find participant (lock)
-    const p = await client.query("SELECT id, event_id, email, name FROM participants WHERE code=$1 FOR UPDATE", [code]);
-    if (p.rows.length === 0) { await client.query("ROLLBACK"); return res.status(404).json({ ok: false, message: "Participant not found" }); }
-    const participant = p.rows[0];
-
-    // allocate pc
-    const pc = await allocatePcForParticipant(client, participant.id, participant.event_id);
-
-    await client.query("COMMIT");
-
-    // email participant about allocation
-    try {
-      await transporter.sendMail({
-        from: process.env.EMAIL_FROM || "Quantum Quirks <no-reply@Quantum Quirks.local>",
-        to: participant.email,
-        subject: "Your PC Allocation — Quantum Quirks",
-        html: `<p>Hi ${participant.name},</p><p>Your PC number for the event: <b>${pc}</b></p>`
-      });
-    } catch (mailErr) { console.warn("allocation mail err", mailErr); }
-
-    return res.json({ ok: true, message: "Verified & allocated", pc });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("verify-code err:", err);
-    return res.status(500).json({ ok: false, message: "Allocation failed" });
-  } finally {
-    client.release();
-  }
-});
-
-// ---------------- Organizer direct allocate (by participant id) ----------
-app.post("/api/organizer/allocate", authMiddleware, requireRole("organizer"), async (req, res) => {
-  const { participantId } = req.body;
-  if (!participantId) return res.status(400).json({ ok: false, message: "participantId required" });
-
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
-    const pRes = await client.query("SELECT id, event_id, email, name FROM participants WHERE id=$1 FOR UPDATE", [participantId]);
-    if (pRes.rows.length === 0) { await client.query("ROLLBACK"); return res.status(404).json({ ok: false, message: "Participant not found" }); }
-    const participant = pRes.rows[0];
-
-    const pc = await allocatePcForParticipant(client, participant.id, participant.event_id);
+    // Fetch user details
+    const p = await client.query("SELECT id, event_id, name, email FROM participants WHERE code=$1 FOR UPDATE", [code]);
+    if (p.rows.length === 0) { await client.query("ROLLBACK"); return res.status(404).json({ ok: false, message: "Code not found" }); }
+    
+    const user = p.rows[0];
+    const pc = await allocatePcForParticipant(client, user.id, user.event_id);
+    
+    // Get Event Name
+    const ev = await client.query("SELECT name FROM events WHERE id=$1", [user.event_id]);
+    const eventName = ev.rows[0].name;
 
     await client.query("COMMIT");
 
-    try {
-      await transporter.sendMail({
-        from: process.env.EMAIL_FROM || "Quantum Quirks <no-reply@Quantum Quirks.local>",
-        to: participant.email,
-        subject: "PC Allocated by Organizer",
-        html: `<p>Hi ${participant.name},</p><p>Your PC number: <b>${pc}</b></p>`
-      });
-    } catch (mailErr) { console.warn("organizer allocate mail err", mailErr); }
+    // Send "Matrix" Email
+    await resend.emails.send({
+      from: EMAIL_FROM, to: user.email, subject: `[TERMINAL ASSIGNED] ${eventName}`,
+      html: getPcAllocationHtml(eventName, user.name, `PC-${pc}`)
+    });
 
-    return res.json({ ok: true, message: "Allocated", pc });
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("organizer allocate err:", err);
-    return res.status(500).json({ ok: false, message: "Allocation failed" });
-  } finally {
-    client.release();
-  }
-});
-// DELETE Event (and all participants inside)
-app.delete("/api/events/:id",authMiddleware, requireRole("organizer"), async (req, res) => {
-  const eventId = Number(req.params.id);
-  if (!eventId) return res.status(400).json({ ok: false, message: "Invalid event ID" });
-
-  try {
-    // Delete participants first
-    await pool.query("DELETE FROM participants WHERE event_id = $1", [eventId]);
-    // Delete the event
-    const result = await pool.query("DELETE FROM events WHERE id = $1 RETURNING *", [eventId]);
-    if (!result.rows.length) return res.status(404).json({ ok: false, message: "Event not found" });
-    res.json({ ok: true, message: "Event and its participants deleted successfully" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, message: "Server error" });
-  }
+    return res.json({ ok: true, message: "Success", pc });
+  } catch (err) { await client.query("ROLLBACK"); console.error(err); return res.status(500).json({ ok: false }); } finally { client.release(); }
 });
 
-// DELETE Participant by ID
-app.delete("/api/participants/:id",authMiddleware, requireRole("organizer"), async (req, res) => {
-  const participantId = Number(req.params.id);
-  if (!participantId) return res.status(400).json({ ok: false, message: "Invalid participant ID" });
-
-  try {
-    const result = await pool.query("DELETE FROM participants WHERE id = $1 RETURNING *", [participantId]);
-    if (!result.rows.length) return res.status(404).json({ ok: false, message: "Participant not found" });
-    res.json({ ok: true, message: "Participant deleted successfully" });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, message: "Server error" });
-  }
-});
-
-
-// ---------------- Admin utility: create organizer or volunteer (secure — for setup) ----------
-app.post("/api/seed/create-user", async (req, res) => {
-  // For safety: require an env secret as basic guard
-  if (req.headers["x-seed-secret"] !== process.env.SEED_API_SECRET) {
-    return res.status(403).json({ ok: false, message: "Forbidden" });
-  }
-  const { type, username, password } = req.body;
-  if (!type || !username || !password) return res.status(400).json({ ok: false, message: "type/username/password required" });
-  try {
-    const hash = await bcrypt.hash(password, 10);
-    if (type === "organizer") {
-      await pool.query("INSERT INTO organizers (username, password_hash) VALUES ($1,$2) ON CONFLICT DO NOTHING", [username, hash]);
-      return res.json({ ok: true, message: "Organizer seeded" });
-    } else if (type === "volunteer") {
-      await pool.query("INSERT INTO volunteers (vol_id, password_hash) VALUES ($1,$2) ON CONFLICT DO NOTHING", [username, hash]);
-      return res.json({ ok: true, message: "Volunteer seeded" });
-    } else return res.status(400).json({ ok: false, message: "type must be organizer|volunteer" });
-  } catch (err) {
-    console.error("seed create user err:", err);
-    return res.status(500).json({ ok: false, message: "Failed to seed user" });
-  }
-});
-
-
-import multer from "multer";
-import path from "path";
-
-
-
-// ensure static uploads folder exists
-
-
-// ---------------- Load participants by event + language ----------------
-// ---------------- Participants (Organizer view) ----------------
-
-// Get all participants with event name
-app.get("/api/participants", async (req, res) => {
-  try {
-    const r = await pool.query(`
-      SELECT p.id, p.name, p.email, p.preferred_language AS language,
-             e.name AS event_name
-      FROM participants p
-      JOIN events e ON p.event_id = e.id
-      ORDER BY p.id ASC
-    `);
-    return res.json({ ok: true, participants: r.rows });
-  } catch (err) {
-    console.error("get participants err:", err);
-    return res.status(500).json({ ok: false, message: "Failed to fetch participants" });
-  }
-});
-
-// Update participant details
-app.put("/api/participants/:id", async (req, res) => {
-  const { id } = req.params;
-  const { name, email, language, event_name } = req.body;
-
-  if (!name || !email || !language || !event_name) {
-    return res.status(400).json({ ok: false, message: "All fields required" });
-  }
-
-  try {
-    // find event id by event_name
-    const ev = await pool.query("SELECT id FROM events WHERE name=$1", [event_name]);
-    if (ev.rows.length === 0) {
-      return res.status(404).json({ ok: false, message: "Event not found" });
-    }
-    const eventId = ev.rows[0].id;
-
-    // update participant
-    const r = await pool.query(
-      `UPDATE participants
-       SET name=$1, email=$2, preferred_language=$3, event_id=$4
-       WHERE id=$5 RETURNING *`,
-      [name, email, language, eventId, id]
-    );
-
-    if (r.rows.length === 0) {
-      return res.status(404).json({ ok: false, message: "Participant not found" });
-    }
-
-    // send notification email
-    try {
-      await transporter.sendMail({
-        from: process.env.EMAIL_FROM || "Quantum Quirks <no-reply@QuantumQuirks.local>",
-        to: email,
-        subject: "Your Details Have Been Updated",
-        html: `
-          <p>Hello ${name},</p>
-          <p>Your registration details have been updated:</p>
-          <ul>
-            <li><b>Name:</b> ${name}</li>
-            <li><b>Email:</b> ${email}</li>
-            <li><b>Preferred Language:</b> ${language}</li>
-            <li><b>Event:</b> ${event_name}</li>
-          </ul>
-          <p>If you didn’t request this change, please contact the organizers.</p>
-        `
-      });
-    } catch (mailErr) {
-      console.warn("update notify mail failed:", mailErr);
-    }
-
-    return res.json({ ok: true, participant: r.rows[0] });
-  } catch (err) {
-    console.error("update participant err:", err);
-    return res.status(500).json({ ok: false, message: "Failed to update participant" });
-  }
-});
-
-// ---------------- Update participant ----------------
-app.put("/api/participants/:id", authMiddleware, requireRole("organizer"), async (req, res) => {
-  const participantId = Number(req.params.id); // Get ID from URL
-  const { name, email, language } = req.body; // No 'id' in body
-
-  if (!name || !email || !language) {
-    return res.status(400).json({ ok: false, message: "All fields required" });
-  }
-
-  try {
-    const result = await pool.query(
-      `UPDATE participants 
-       SET name = $1, email = $2, preferred_language = $3
-       WHERE id = $4
-       RETURNING id, name, email, preferred_language AS "preferredLanguage"`,
-      [name, email, language, participantId] // use participantId from URL
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ ok: false, message: "Participant not found" });
-    }
-
-    res.json({ ok: true, participant: result.rows[0] });
-  } catch (err) {
-    console.error("Update participant error:", err);
-    res.status(500).json({ ok: false, message: "Failed to update participant" });
-  }
-});
-
-
-import { fileURLToPath } from "url";
-
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-
-// Serve files from backend/public/gallery
-// Serve gallery images with proper CORS headers
-app.use(
-  "/gallery",
-  (req, res, next) => {
-    // Allow your frontend domain
-    res.setHeader("Access-Control-Allow-Origin", "http://localhost:5500");
-    res.setHeader("Cross-Origin-Resource-Policy", "cross-origin"); // <-- key fix
-    next();
-  },
-  express.static(path.join(__dirname, "public/gallery"))
-);
-
-
-// Setup Multer storage
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, "public/gallery"); // folder must exist
-  },
-  filename: (req, file, cb) => {
-    cb(null, Date.now() + path.extname(file.originalname));
-  }
-});
-
+// 10. GALLERY
+const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
-// POST /api/organizer/gallery/:eventId
-app.post(
-  "/api/organizer/gallery/:eventId",
-  authMiddleware,
-  requireRole("organizer"),
-  upload.single("image"),
-  async (req, res) => {
-    try {
-      const eventId = Number(req.params.eventId);
-      if (!req.file) return res.status(400).json({ ok: false, message: "No image uploaded" });
-
-      const description = req.body.description || "";
-      // Store relative path to match static route
-      const imagePath = `/gallery/${req.file.filename}`;
-
-      const result = await pool.query(
-        `INSERT INTO gallery_images (event_id, image_path, description, event_date)
-         VALUES ($1, $2, $3, (SELECT end_date FROM events WHERE id=$1))
-         RETURNING id, event_id, image_path, description, event_date`,
-        [eventId, imagePath, description]
-      );
-
-      res.json({ ok: true, message: "Image uploaded successfully", image: result.rows[0] });
-    } catch (err) {
-      console.error("Gallery upload error:", err);
-      res.status(500).json({ ok: false, message: "Upload failed" });
-    }
-  }
-);
-
-
-
-// GET /api/gallery/:eventId
-// GET /api/gallery/:eventId
-// Gallery API (fetch images for an event)
-app.get("/api/gallery/:eventId", async (req, res) => {
-  const eventId = Number(req.params.eventId);
-
+app.post("/api/organizer/gallery/:eventId", authMiddleware, requireRole("organizer"), upload.single("image"), async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT id, event_id, image_path, description, event_date
-       FROM gallery_images
-       WHERE event_id = $1
-       ORDER BY id ASC`,
-      [eventId]
-    );
+    const eventId = Number(req.params.eventId);
+    if (!req.file) return res.status(400).json({ ok: false, message: "No image" });
+    const evRes = await pool.query("SELECT name, end_date FROM events WHERE id=$1", [eventId]);
+    const { publicUrl, fileId } = await uploadToGoogleDrive(req.file.buffer, `${Date.now()}-${req.file.originalname}`, req.file.mimetype, evRes.rows[0].name);
+    const result = await pool.query(`INSERT INTO gallery_images (event_id, image_path, description, event_date, drive_file_id) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [eventId, publicUrl, req.body.description || "", evRes.rows[0].end_date, fileId]);
+    res.json({ ok: true, image: result.rows[0] });
+  } catch (err) { res.status(500).json({ ok: false }); }
+});
 
-    // Return images with the same path used in static route
-    const images = result.rows.map(row => ({
-      image_path: row.image_path,  // e.g., "/gallery/1757767320194.jpg"
-      description: row.description || ""
-    }));
+app.get("/api/gallery/:eventId", async (req, res) => {
+  try { const result = await pool.query("SELECT * FROM gallery_images WHERE event_id = $1 ORDER BY id ASC", [req.params.eventId]); res.json({ ok: true, images: result.rows }); } catch (err) { res.status(500).json({ ok: false }); }
+});
 
-    res.json({ ok: true, images });
-  } catch (err) {
-    console.error("Gallery fetch error:", err);
-    res.status(500).json({ ok: false, images: [], error: "Failed to fetch gallery" });
-  }
+app.delete("/api/organizer/gallery/:imageId", authMiddleware, requireRole("organizer"), async (req, res) => {
+  try {
+    const imgRes = await pool.query("SELECT drive_file_id FROM gallery_images WHERE id=$1", [req.params.imageId]);
+    if (imgRes.rows.length === 0) return res.status(404).json({ ok: false });
+    if (imgRes.rows[0].drive_file_id) { try { await drive.files.delete({ fileId: imgRes.rows[0].drive_file_id }); } catch (e) { console.warn("Drive delete failed"); } }
+    await pool.query("DELETE FROM gallery_images WHERE id=$1", [req.params.imageId]);
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ ok: false }); }
+});
+
+// 11. CONTACT & SEED
+app.get("/contacts", authMiddleware, async (req, res) => {
+  try { if (req.user.role !== "organizer") return res.status(403).json({ ok: false }); const result = await pool.query("SELECT * FROM contact_messages ORDER BY created_at DESC"); res.json({ ok: true, contacts: result.rows }); } catch (err) { res.status(500).json({ ok: false }); }
+});
+
+app.delete("/contacts/:id", authMiddleware, async (req, res) => {
+  try { if (req.user.role !== "organizer") return res.status(403).json({ ok: false }); await pool.query("DELETE FROM contact_messages WHERE id=$1", [req.params.id]); res.json({ ok: true }); } catch (err) { res.status(500).json({ ok: false }); }
 });
 
 app.post("/api/contact", async (req, res) => {
-  try {
-    const { name, email, message } = req.body;
+  try { await pool.query("INSERT INTO contact_messages (name, email, message) VALUES ($1, $2, $3)", [req.body.name, req.body.email, req.body.message]); res.json({ ok: true }); } catch (err) { res.status(500).json({ ok: false }); }
+});
 
-    if (!name || !email || !message) {
-      return res.status(400).json({ ok: false, error: "All fields are required" });
+app.post("/api/seed/create-user", async (req, res) => {
+  if (req.headers["x-seed-secret"] !== process.env.SEED_API_SECRET) return res.status(403).json({ ok: false });
+  const hash = await bcrypt.hash(req.body.password, 10);
+  if (req.body.type === "organizer") await pool.query("INSERT INTO organizers (username, password_hash) VALUES ($1,$2)", [req.body.username, hash]);
+  res.json({ ok: true });
+});
+// UPDATED: Route changed to '/update/:id' to avoid conflicts
+app.put("/api/events/update/:id", authMiddleware, requireRole("organizer"), async (req, res) => {
+  const { name, amount, description, endDate, languages, type, groupSize } = req.body;
+  const id = req.params.id;
+  try {
+    const slug = name.toLowerCase().replace(/\s+/g, "-").slice(0, 80);
+    const langString = Array.isArray(languages) ? languages.join(',') : (languages || "");
+
+    await pool.query(
+      `UPDATE events SET 
+        name=$1, 
+        slug=$2, 
+        entry_amount=$3, 
+        description=$4, 
+        end_date=$5, 
+        allowed_languages=$6, 
+        participation_type=$7, 
+        max_group_size=$8 
+       WHERE id=$9`,
+      [name, slug, amount, description || "", endDate, langString, type || "Solo", groupSize || 1, id]
+    );
+    res.json({ ok: true, message: "Event Updated" });
+  } catch (err) {
+    console.error("Update Event Error:", err);
+    res.status(500).json({ ok: false, message: "Failed to update event" });
+  }
+});
+import crypto from "crypto";
+
+// Memory store for tokens: { "token123": { email: "...", expiresAt: 12345 } }
+const resetTokens = new Map();
+
+// --- 1. REQUEST LINK ---
+app.post("/api/auth/request-forgot-password", async (req, res) => {
+  const { identifier } = req.body;
+  try {
+    const userRes = await pool.query(
+      "SELECT email, username, last_password_reset FROM organizers WHERE username = $1 OR phone = $2",
+      [identifier, identifier]
+    );
+
+    if (userRes.rows.length === 0) return res.status(404).json({ ok: false, message: "User not found." });
+
+    const user = userRes.rows[0];
+
+    // 15-Day Cooldown Check
+    const lastReset = new Date(user.last_password_reset);
+    const diffDays = Math.ceil((new Date() - lastReset) / (1000 * 60 * 60 * 24));
+    if (diffDays < 15) {
+      return res.status(403).json({ ok: false, message: `Wait ${15 - diffDays} more days to reset.` });
     }
 
-    // Insert into database
-    const query = `
-      INSERT INTO contact_messages (name, email, message, created_at)
-      VALUES ($1, $2, $3, NOW()) RETURNING id
-    `;
-    const values = [name, email, message];
-    const result = await pool.query(query, values);
+    // Generate Single-Use Token
+    const token = crypto.randomBytes(32).toString("hex");
+    resetTokens.set(token, { email: user.email, expiresAt: Date.now() + 15 * 60 * 1000 });
 
-    console.log("📩 New contact saved:", result.rows[0]);
+    const resetLink = `http://localhost:5500/login/reset-password.html?token=${token}`;
+    await resend.emails.send({
+      from: EMAIL_FROM,
+      to: user.email,
+      subject: "One-Time Password Reset Link",
+      html: `<p>Your single-use link: <a href="${resetLink}">${resetLink}</a></p>`
+    });
 
-    return res.json({ ok: true, msg: "Message saved successfully!" });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ ok: false }); }
+});
+
+// --- 2. VALIDATE TOKEN (Called when page loads) ---
+app.get("/api/auth/validate-reset-token/:token", (req, res) => {
+  const { token } = req.params;
+  const record = resetTokens.get(token);
+
+  if (!record || Date.now() > record.expiresAt) {
+    if (record) resetTokens.delete(token); // Cleanup expired
+    return res.status(400).json({ ok: false, message: "Link invalid or expired." });
+  }
+  res.json({ ok: true });
+});
+
+// --- 3. EXECUTE RESET (Consumes the token) ---
+app.post("/api/auth/reset-password", async (req, res) => {
+  const { token, password } = req.body;
+  const record = resetTokens.get(token);
+
+  if (!record) return res.status(400).json({ ok: false, message: "This link has already been used." });
+
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    await pool.query("UPDATE organizers SET password = $1, last_password_reset = NOW() WHERE email = $2", [hashedPassword, record.email]);
+
+    // CONSUME TOKEN: Delete it so it can never be used again
+    resetTokens.delete(token);
+
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ ok: false }); }
+});
+// 1. Fetch all Staff (Organizers and Volunteers)
+// This queries both tables and combines them
+app.get("/api/admin/staff", authMiddleware, requireRole("organizer"), async (req, res) => {
+  try {
+      // We select the basic info. 
+      // Note: Postgres doesn't allow 'decrypting' bcrypt, so passwords aren't sent.
+      const orgs = await pool.query("SELECT id, name, email, phone, username, 'organizer' as role FROM organizers");
+      const vols = await pool.query("SELECT id, name, email, phone, vol_id as username, 'volunteer' as role FROM volunteers");
+      
+      res.json({ ok: true, staff: [...orgs.rows, ...vols.rows] });
   } catch (err) {
-    console.error("❌ Error saving contact:", err);
-    return res.status(500).json({ ok: false, error: "Server error" });
+      console.error(err);
+      res.status(500).json({ ok: false, message: "Failed to fetch staff" });
   }
 });
 
+// 2. Delete Staff Member
+app.delete("/api/admin/staff/:role/:id", authMiddleware, requireRole("organizer"), async (req, res) => {
+  const { role, id } = req.params;
+  try {
+      const table = role === 'organizer' ? 'organizers' : 'volunteers';
+      await pool.query(`DELETE FROM ${table} WHERE id = $1`, [id]);
+      res.json({ ok: true, message: "Staff member removed" });
+  } catch (err) {
+      res.status(500).json({ ok: false, message: "Delete failed" });
+  }
+});
+
+// 3. Update Staff Info (Not Username/Password)
+app.put("/api/admin/staff/:role/:id", authMiddleware, requireRole("organizer"), async (req, res) => {
+  const { role, id } = req.params;
+  const { name, email, phone } = req.body;
+  try {
+      const table = role === 'organizer' ? 'organizers' : 'volunteers';
+      await pool.query(
+          `UPDATE ${table} SET name=$1, email=$2, phone=$3 WHERE id=$4`,
+          [name, email, phone, id]
+      );
+      res.json({ ok: true, message: "Info updated" });
+  } catch (err) {
+      res.status(500).json({ ok: false });
+  }
+});
+// --- FIND AND REPLACE ALL "/api/verify-code" ROUTES WITH THIS ONE ---
+
+app.post("/api/recheck/verify-code", authMiddleware, async (req, res) => {
+  let { code } = req.body;
+  if (!code) return res.status(400).json({ ok: false, message: "Code required" });
+  code = code.trim().toUpperCase();
+
+  const client = await pool.connect();
+  try {
+    const pRes = await client.query("SELECT id, event_id, name, email FROM participants WHERE code=$1", [code]);
+    if (pRes.rows.length === 0) return res.status(404).json({ ok: false, message: "Code not found in database." });
+    const user = pRes.rows[0];
+
+    const existing = await client.query("SELECT pc_number FROM allocations WHERE participant_id=$1", [user.id]);
+    if (existing.rows.length > 0) {
+      return res.json({ ok: true, alreadyAllocated: true, pc: existing.rows[0].pc_number, name: user.name });
+    }
+
+    await client.query("BEGIN");
+    const pc = await allocatePcForParticipant(client, user.id, user.event_id);
+    const ev = await client.query("SELECT name FROM events WHERE id=$1", [user.event_id]);
+    await client.query("COMMIT");
+
+    await resend.emails.send({
+      from: EMAIL_FROM, to: user.email, subject: `[STATION ASSIGNED] ${ev.rows[0].name}`,
+      html: getPcAllocationHtml(ev.rows[0].name, user.name, `PC-${pc}`)
+    });
+
+    res.json({ ok: true, alreadyAllocated: false, pc, name: user.name });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ ok: false });
+  } finally { client.release(); }
+});
 
 
+app.get("/api/volunteer/allocations", authMiddleware, async (req, res) => {
+  const r = await pool.query(`SELECT a.pc_number, p.name, p.phone, p.code FROM allocations a JOIN participants p ON a.participant_id = p.id ORDER BY a.allocated_at DESC`);
+  res.json({ ok: true, allocations: r.rows });
+});
 // ---------- Start ----------
 app.listen(PORT, () => console.log(`✅ Server listening on http://localhost:${PORT}`));
