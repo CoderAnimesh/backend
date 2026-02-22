@@ -634,14 +634,44 @@ app.post("/api/organizer/volunteer", authMiddleware, requireRole("organizer"), a
   } catch (err) { res.status(500).json({ ok: false, message: "Failed to add volunteer" }); }
 });
 
+// 8. STAFF MANAGEMENT (Updated to send credentials via email)
 app.post("/api/admin/organizer", authMiddleware, requireRole("organizer"), async (req, res) => {
-  try {
-    const { name, email, phone, username, password } = req.body;
-    const hashed = await bcrypt.hash(password, 10);
-    const result = await pool.query(`INSERT INTO organizers (name, email, phone, username, password, role) VALUES ($1,$2,$3,$4,$5,'organizer') RETURNING *`, [name, email, phone, username, hashed]);
-    res.json({ ok: true, organizer: result.rows[0] });
-  } catch (err) { res.status(500).json({ ok: false, message: "Failed to add organizer" }); }
-});
+    try {
+      const { name, email, phone, username, password } = req.body;
+      
+      // Hash the password for the database
+      const hashed = await bcrypt.hash(password, 10);
+      
+      // Store the organizer details
+      const result = await pool.query(
+        `INSERT INTO organizers (name, email, phone, username, password, role) VALUES ($1,$2,$3,$4,$5,'organizer') RETURNING *`, 
+        [name, email, phone, username, hashed]
+      );
+  
+      // --- NEW: Send Email with Credentials ---
+      await resend.emails.send({
+        from: EMAIL_FROM,
+        to: email,
+        subject: "Welcome! Your Organizer Credentials",
+        html: `
+          <div style="font-family: Arial, sans-serif; background-color: #0d1117; color: #c9d1d9; padding: 30px; border-radius: 8px; max-width: 500px; margin: auto; border: 1px solid #30363d;">
+            <h2 style="color: #58a6ff; margin-top: 0;">Welcome to the Team, ${name}!</h2>
+            <p style="font-size: 16px;">You have been successfully added as an Organizer.</p>
+            <div style="background-color: #161b22; padding: 20px; border-radius: 6px; border: 1px solid #21262d; margin: 20px 0;">
+              <p style="margin: 0 0 10px 0;"><strong>User ID / Username:</strong> <span style="color: #ffffff;">${username}</span></p>
+              <p style="margin: 0;"><strong>Password:</strong> <span style="color: #ffffff;">${password}</span></p>
+            </div>
+            <p style="font-size: 14px; color: #8b949e;">Please log in using these credentials. We recommend changing your password shortly after your first login.</p>
+          </div>
+        `
+      });
+  
+      res.json({ ok: true, organizer: result.rows[0], message: "Organizer added and credentials emailed." });
+    } catch (err) { 
+      console.error("Failed to add organizer:", err);
+      res.status(500).json({ ok: false, message: "Failed to add organizer" }); 
+    }
+  });
 
 // 9. ALLOCATION
 async function allocatePcForParticipant(client, participantId, eventId) {
