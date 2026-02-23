@@ -854,7 +854,7 @@ app.post("/api/auth/request-forgot-password", async (req, res) => {
     const token = crypto.randomBytes(32).toString("hex");
     resetTokens.set(token, { email: user.email, expiresAt: Date.now() + 15 * 60 * 1000 });
 
-    const resetLink = `http://localhost:5500/login/reset-password.html?token=${token}`;
+    const resetLink = `http://quantumquirksuoa.co.in/login/reset-password.html?token=${token}`;
     await resend.emails.send({
       from: EMAIL_FROM,
       to: user.email,
