@@ -100,13 +100,56 @@ const drive = google.drive({ version: "v3", auth: oauth2Client });
 
 async function getOrCreateSubfolder(folderName, parentId) {
   try {
-    const query = `mimeType='application/vnd.google-apps.folder' and name='${folderName.replace(/'/g, "\\'")}' and '${parentId}' in parents and trashed=false`;
-    const res = await drive.files.list({ q: query, fields: 'files(id, name)', spaces: 'drive' });
-    if (res.data.files.length > 0) return res.data.files[0].id;
-    const folder = await drive.files.create({ resource: { name: folderName, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] }, fields: 'id' });
-    await drive.permissions.create({ fileId: folder.data.id, requestBody: { role: "reader", type: "anyone" } });
+    // 1. Better escaping for the folder name to prevent query breaks
+    const escapedName = folderName.replace(/'/g, "\\'");
+    const query = `mimeType='application/vnd.google-apps.folder' and name='${escapedName}' and '${parentId}' in parents and trashed=false`;
+
+    const res = await drive.files.list({ 
+      q: query, 
+      fields: 'files(id, name)', 
+      spaces: 'drive' 
+    });
+
+    // 2. Return existing folder ID if found
+    if (res.data.files && res.data.files.length > 0) {
+      return res.data.files[0].id;
+    }
+
+    // 3. Create folder if it doesn't exist
+    const fileMetadata = {
+      name: folderName,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: [parentId]
+    };
+
+    const folder = await drive.files.create({
+      resource: fileMetadata,
+      fields: 'id'
+    });
+
+    // 4. Set permissions so anyone can view images inside via link
+    await drive.permissions.create({
+      fileId: folder.data.id,
+      requestBody: {
+        role: "reader",
+        type: "anyone"
+      }
+    });
+
     return folder.data.id;
-  } catch (err) { throw new Error("Failed to manage event folder"); }
+
+  } catch (err) {
+    // CRITICAL: Log the actual error to the console so you can see the cause
+    console.error("Google Drive getOrCreateSubfolder Error Details:");
+    if (err.response) {
+      // Errors from the Google API (e.g., 404, 403)
+      console.error(err.response.data);
+    } else {
+      // General JavaScript errors (e.g., drive is not defined)
+      console.error(err.message);
+    }
+    throw new Error(`Failed to manage event folder: ${err.message}`);
+  }
 }
 
 async function uploadToGoogleDrive(fileBuffer, fileName, mimeType, folderName) {
@@ -634,61 +677,79 @@ app.post("/api/organizer/volunteer", authMiddleware, requireRole("organizer"), a
   } catch (err) { res.status(500).json({ ok: false, message: "Failed to add volunteer" }); }
 });
 
-// 8. STAFF MANAGEMENT (Updated to send credentials via email)
 app.post("/api/admin/organizer", authMiddleware, requireRole("organizer"), async (req, res) => {
-    try {
-      const { name, email, phone, username, password } = req.body;
-      
-      // Hash the password for the database
-      const hashed = await bcrypt.hash(password, 10);
-      
-      // Store the organizer details
-      const result = await pool.query(
-        `INSERT INTO organizers (name, email, phone, username, password, role) VALUES ($1,$2,$3,$4,$5,'organizer') RETURNING *`, 
-        [name, email, phone, username, hashed]
-      );
-  
-      // --- NEW: Send Email with Credentials ---
-      await resend.emails.send({
-        from: EMAIL_FROM,
-        to: email,
-        subject: "Welcome! Your Organizer Credentials",
-        html: `
-          <div style="font-family: Arial, sans-serif; background-color: #0d1117; color: #c9d1d9; padding: 30px; border-radius: 8px; max-width: 500px; margin: auto; border: 1px solid #30363d;">
-            <h2 style="color: #58a6ff; margin-top: 0;">Welcome to the Team, ${name}!</h2>
-            <p style="font-size: 16px;">You have been successfully added as an Organizer.</p>
-            <div style="background-color: #161b22; padding: 20px; border-radius: 6px; border: 1px solid #21262d; margin: 20px 0;">
-              <p style="margin: 0 0 10px 0;"><strong>User ID / Username:</strong> <span style="color: #ffffff;">${username}</span></p>
-              <p style="margin: 0;"><strong>Password:</strong> <span style="color: #ffffff;">${password}</span></p>
-            </div>
-            <p style="font-size: 14px; color: #8b949e;">Please log in using these credentials. We recommend changing your password shortly after your first login.</p>
-          </div>
-        `
-      });
-  
-      res.json({ ok: true, organizer: result.rows[0], message: "Organizer added and credentials emailed." });
-    } catch (err) { 
-      console.error("Failed to add organizer:", err);
-      res.status(500).json({ ok: false, message: "Failed to add organizer" }); 
-    }
-  });
+  try {
+    const { name, email, phone, username, password } = req.body;
+    const hashed = await bcrypt.hash(password, 10);
+    const result = await pool.query(`INSERT INTO organizers (name, email, phone, username, password, role) VALUES ($1,$2,$3,$4,$5,'organizer') RETURNING *`, [name, email, phone, username, hashed]);
+    res.json({ ok: true, organizer: result.rows[0] });
+  } catch (err) { res.status(500).json({ ok: false, message: "Failed to add organizer" }); }
+});
 
 // 9. ALLOCATION
 async function allocatePcForParticipant(client, participantId, eventId) {
+  // 1. Check if already allocated
   const existing = await client.query("SELECT pc_number FROM allocations WHERE participant_id=$1", [participantId]);
   if (existing.rows.length > 0) return existing.rows[0].pc_number;
-  const langRes = await client.query("SELECT preferred_language FROM participants WHERE id=$1", [participantId]);
-  const myLang = langRes.rows[0].preferred_language;
-  const usedRes = await client.query(`SELECT a.pc_number, p.preferred_language FROM allocations a JOIN participants p ON a.participant_id = p.id WHERE a.event_id=$1 ORDER BY a.pc_number ASC`, [eventId]);
+
+  // 2. Get current participant's details
+  const pRes = await client.query(
+    "SELECT preferred_language, batch, semester FROM participants WHERE id=$1", 
+    [participantId]
+  );
+  const me = pRes.rows[0];
+
+  // 3. Get all current allocations for this event
+  const usedRes = await client.query(`
+    SELECT a.pc_number, p.preferred_language, p.batch, p.semester 
+    FROM allocations a 
+    JOIN participants p ON a.participant_id = p.id 
+    WHERE a.event_id=$1 
+    ORDER BY a.pc_number ASC`, 
+    [eventId]
+  );
   const used = usedRes.rows;
+
+  // Helper function to normalize batch names (e.g., "BCA-DS" -> "BCA")
+  const getBaseBatch = (batchName) => {
+    if (!batchName) return "";
+    // Removes "-DS" or " DS" (case insensitive) to group similar courses
+    return batchName.split(/-DS| DS/i)[0].trim();
+  };
+
+  const myBaseBatch = getBaseBatch(me.batch);
   let pc = 1;
-  while(true){
-    if(used.find(u => u.pc_number === pc)) { pc++; continue; }
-    const left = used.find(u => u.pc_number === pc-1);
-    const right = used.find(u => u.pc_number === pc+1);
-    if((left && left.preferred_language === myLang) || (right && right.preferred_language === myLang)) { pc++; continue; }
+  
+  const isConflict = (neighbor) => {
+    if (!neighbor) return false;
+    
+    const sameLanguage = neighbor.preferred_language === me.preferred_language;
+    
+    // Normalize neighbor's batch and compare
+    const neighborBaseBatch = getBaseBatch(neighbor.batch);
+    const sameClass = (neighborBaseBatch === myBaseBatch && neighbor.semester === me.semester);
+    
+    return sameLanguage || sameClass;
+  };
+
+  while (true) {
+    if (used.find(u => u.pc_number === pc)) { 
+      pc++; 
+      continue; 
+    }
+
+    const left = used.find(u => u.pc_number === pc - 1);
+    const right = used.find(u => u.pc_number === pc + 1);
+
+    if (isConflict(left) || isConflict(right)) {
+      pc++;
+      continue;
+    }
+
     break;
   }
+
+  // 4. Finalize Allocation
   await client.query("INSERT INTO allocations (event_id, participant_id, pc_number) VALUES ($1,$2,$3)", [eventId, participantId, pc]);
   return pc;
 }
@@ -854,7 +915,7 @@ app.post("/api/auth/request-forgot-password", async (req, res) => {
     const token = crypto.randomBytes(32).toString("hex");
     resetTokens.set(token, { email: user.email, expiresAt: Date.now() + 15 * 60 * 1000 });
 
-    const resetLink = `http://quantumquirksuoa.co.in/login/reset-password.html?token=${token}`;
+    const resetLink = `http://localhost:5500/login/reset-password.html?token=${token}`;
     await resend.emails.send({
       from: EMAIL_FROM,
       to: user.email,
@@ -977,6 +1038,97 @@ app.post("/api/recheck/verify-code", authMiddleware, async (req, res) => {
 app.get("/api/volunteer/allocations", authMiddleware, async (req, res) => {
   const r = await pool.query(`SELECT a.pc_number, p.name, p.phone, p.code FROM allocations a JOIN participants p ON a.participant_id = p.id ORDER BY a.allocated_at DESC`);
   res.json({ ok: true, allocations: r.rows });
+});
+// --- GET ALL ALLOCATIONS FOR LIVE REGISTRY ---
+app.get("/api/volunteer/allocations", authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT 
+        a.pc_number, 
+        p.name, 
+        p.phone, 
+        p.code,
+        a.allocated_at
+      FROM allocations a 
+      JOIN participants p ON a.participant_id = p.id 
+      ORDER BY a.allocated_at DESC
+    `);
+    
+    res.json({ ok: true, allocations: r.rows });
+  } catch (err) {
+    console.error("Registry fetch error:", err);
+    res.status(500).json({ ok: false, message: "Database sync error" });
+  }
+});
+// --- VERIFY & ALLOCATE ---
+app.post("/api/recheck/verify-code", authMiddleware, async (req, res) => {
+  let { code } = req.body;
+  if (!code) return res.status(400).json({ ok: false, message: "Code required" });
+  
+  code = code.trim().toUpperCase();
+  const client = await pool.connect();
+
+  try {
+    // 1. Find the participant by code
+    const pRes = await client.query(
+      "SELECT id, event_id, name, email FROM participants WHERE code=$1", 
+      [code]
+    );
+
+    if (pRes.rows.length === 0) {
+      return res.status(404).json({ ok: false, message: "Invalid Code: Not found in database." });
+    }
+
+    const user = pRes.rows[0];
+
+    // 2. Check if this participant already has a PC assigned
+    const existing = await client.query(
+      "SELECT pc_number FROM allocations WHERE participant_id=$1", 
+      [user.id]
+    );
+
+    if (existing.rows.length > 0) {
+      // Return details for the frontend to show the "Already Verified" modal
+      return res.json({ 
+        ok: true, 
+        alreadyAllocated: true, 
+        pc: existing.rows[0].pc_number, 
+        name: user.name 
+      });
+    }
+
+    // 3. Perform new allocation
+    await client.query("BEGIN");
+    
+    // Using your existing allocation logic helper
+    const pc = await allocatePcForParticipant(client, user.id, user.event_id);
+    const ev = await client.query("SELECT name FROM events WHERE id=$1", [user.event_id]);
+    
+    await client.query("COMMIT");
+
+    // 4. Dispatch Email with PC Details
+    await resend.emails.send({
+      from: EMAIL_FROM, 
+      to: user.email, 
+      subject: `[STATION ASSIGNED] ${ev.rows[0].name}`,
+      html: getPcAllocationHtml(ev.rows[0].name, user.name, `PC-${pc}`)
+    });
+
+    // 5. Respond to trigger the frontend "Success Badge"
+    res.json({ 
+      ok: true, 
+      alreadyAllocated: false, 
+      pc, 
+      name: user.name 
+    });
+
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Allocation Error:", err);
+    res.status(500).json({ ok: false, message: "Internal allocation failure." });
+  } finally { 
+    client.release(); 
+  }
 });
 // ---------- Start ----------
 app.listen(PORT, () => console.log(`✅ Server listening on http://localhost:${PORT}`));
