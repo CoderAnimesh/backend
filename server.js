@@ -438,19 +438,54 @@ app.post("/api/check-email", async (req, res) => {
     return res.json({ ok: true });
   } catch (err) { return res.status(500).json({ ok: false }); }
 });
+// OTP EMAIL TEMPLATE (Sleek Tech Theme)
+const getOtpHtml = (name, code) => {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <body style="margin:0; padding:0; background-color:#0d1117; font-family: sans-serif;">
+    <table role="presentation" width="100%" style="background-color:#0d1117; padding: 40px 10px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" style="max-width: 450px; background-color: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 30px; text-align: center;">
+            <tr>
+              <td>
+                <h2 style="color: #ffffff; margin: 0;">Verification Required</h2>
+                <p style="color: #8b949e; font-size: 14px; margin-top: 8px;">Hello ${name || "Participant"}, use the code below to verify your email for Quantum Quirks.</p>
+                <div style="background-color: #0d1117; border: 1px solid #58a6ff; border-radius: 8px; padding: 20px; margin: 25px 0;">
+                  <span style="color: #58a6ff; font-family: 'Courier New', monospace; font-size: 32px; font-weight: bold; letter-spacing: 5px;">${code}</span>
+                </div>
+                <p style="color: #8b949e; font-size: 12px;">This code will expire in 10 minutes. If you didn't request this, please ignore this email.</p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+  </html>`;
+};
 
 // 3. OTP ROUTES
 app.post("/api/otp/:eventId/send", async (req, res) => {
   const { email, name } = req.body;
   if (!email) return res.status(400).json({ ok: false, message: "Email required" });
+  
   const code = createOTP(6);
   setOTP(email, code);
-  try {
-    await resend.emails.send({ from: EMAIL_FROM, to: email, subject: "Your Quantum Quirks OTP", html: `<p>Hello ${name || ""},</p><p>Your OTP code is:</p><h2>${code}</h2>` });
-    return res.json({ ok: true, message: "OTP sent" });
-  } catch (err) { return res.status(500).json({ ok: false }); }
-});
 
+  try {
+    await resend.emails.send({ 
+      from: EMAIL_FROM, 
+      to: email, 
+      subject: `[OTP] Verification Code: ${code}`, 
+      html: getOtpHtml(name, code) 
+    });
+    return res.json({ ok: true, message: "OTP sent" });
+  } catch (err) { 
+    return res.status(500).json({ ok: false }); 
+  }
+});
 app.post("/api/otp/:eventId/verify", (req, res) => {
   const { email, otp } = req.body;
   const record = getOTP(email);
@@ -667,14 +702,64 @@ app.delete("/api/participants/:id", authMiddleware, requireRole("organizer"), as
   try { await pool.query("DELETE FROM participants WHERE id = $1", [req.params.id]); res.json({ ok: true, message: "Participant Deleted" }); } catch (err) { res.status(500).json({ ok: false, message: "Failed to delete participant" }); }
 });
 
+const getVolunteerWelcomeHtml = (name, username, password) => {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <body style="margin:0; padding:0; background-color:#0d1117; font-family: 'Courier New', monospace;">
+    <table role="presentation" width="100%" style="background-color:#0d1117; padding: 40px 10px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" style="max-width: 500px; border: 1px solid #238636; background-color: #0d1117; border-radius: 8px; overflow: hidden;">
+            <tr style="background-color: #238636;">
+              <td style="padding: 15px; text-align: center; color: white; font-weight: bold;">STAFF ACCESS GRANTED</td>
+            </tr>
+            <tr>
+              <td style="padding: 30px; color: #c9d1d9;">
+                <p>Welcome to the team, <strong>${name}</strong>!</p>
+                <p>Your volunteer account for <strong>Quantum Quirks</strong> has been created. Use the credentials below to log in to the staff portal:</p>
+                <div style="background: #161b22; padding: 15px; border-radius: 5px; border-left: 4px solid #238636;">
+                  <p style="margin: 5px 0;"><strong>Username:</strong> ${username}</p>
+                  <p style="margin: 5px 0;"><strong>Password:</strong> ${password}</p>
+                </div>
+                <p style="font-size: 12px; color: #8b949e; margin-top: 20px;">Please change your password after your first login.</p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+  </html>`;
+};
+
 // 8. STAFF MANAGEMENT
 app.post("/api/organizer/volunteer", authMiddleware, requireRole("organizer"), async (req, res) => {
   try {
     const { name, email, phone, username, password } = req.body;
+    
+    // 1. Hash the password for DB storage
     const hashed = await bcrypt.hash(password, 10);
-    const result = await pool.query(`INSERT INTO volunteers (vol_id, password_hash, name, email, phone) VALUES ($1,$2,$3,$4,$5) RETURNING *`, [username, hashed, name, email, phone]);
-    res.json({ ok: true, volunteer: result.rows[0] });
-  } catch (err) { res.status(500).json({ ok: false, message: "Failed to add volunteer" }); }
+    
+    // 2. Insert into DB
+    const result = await pool.query(
+      `INSERT INTO volunteers (vol_id, password_hash, name, email, phone) VALUES ($1,$2,$3,$4,$5) RETURNING *`, 
+      [username, hashed, name, email, phone]
+    );
+
+    // 3. Send credentials to the volunteer's email
+    await resend.emails.send({
+      from: EMAIL_FROM,
+      to: email,
+      subject: "[Quantum Quirks] Your Staff Credentials",
+      html: getVolunteerWelcomeHtml(name, username, password) // Sending raw password here so they know what it is
+    });
+
+    res.json({ ok: true, volunteer: result.rows[0], message: "Volunteer created and email sent." });
+  } catch (err) { 
+    console.error(err);
+    res.status(500).json({ ok: false, message: "Failed to add volunteer" }); 
+  }
 });
 
 app.post("/api/admin/organizer", authMiddleware, requireRole("organizer"), async (req, res) => {
