@@ -761,14 +761,77 @@ app.post("/api/organizer/volunteer", authMiddleware, requireRole("organizer"), a
     res.status(500).json({ ok: false, message: "Failed to add volunteer" }); 
   }
 });
+const getOrganizerWelcomeHtml = (name, username, password) => {
+  return `
+  <!DOCTYPE html>
+  <html>
+  <body style="margin:0; padding:0; background-color:#0d1117; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;">
+    <table role="presentation" width="100%" style="background-color:#0d1117; padding: 40px 10px;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="100%" style="max-width: 500px; border: 1px solid #58a6ff; background-color: #161b22; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5);">
+            <tr style="background-color: #58a6ff;">
+              <td style="padding: 20px; text-align: center; color: #ffffff;">
+                <h2 style="margin: 0; letter-spacing: 1px;">ORGANIZER ACCESS ACTIVATED</h2>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding: 30px; color: #c9d1d9; line-height: 1.6;">
+                <p style="font-size: 18px; color: #ffffff;">Welcome, <strong>${name}</strong>.</p>
+                <p>You have been granted <strong>Organizer privileges</strong> for the Quantum Quirks platform. You now have full access to event management, participant records, and financial approvals.</p>
+                
+                <div style="background: #0d1117; padding: 20px; border-radius: 8px; border: 1px solid #30363d; margin: 20px 0;">
+                  <p style="margin: 0 0 10px 0; color: #8b949e; font-size: 12px; text-transform: uppercase;">Login Credentials</p>
+                  <p style="margin: 5px 0; font-family: monospace;"><strong>Username:</strong> <span style="color: #58a6ff;">${username}</span></p>
+                  <p style="margin: 5px 0; font-family: monospace;"><strong>Password:</strong> <span style="color: #58a6ff;">${password}</span></p>
+                </div>
+
+                <p style="font-size: 13px; color: #8b949e; font-style: italic;">Note: This is a secure account. Please update your password immediately via the profile settings to maintain system integrity.</p>
+                
+                <div style="text-align: center; margin-top: 30px;">
+                  <a href="https://quantumquirksuoa.co.in/login" style="background-color: #238636; color: white; padding: 12px 25px; text-decoration: none; border-radius: 6px; font-weight: bold;">Enter Dashboard</a>
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+  </html>`;
+};
 
 app.post("/api/admin/organizer", authMiddleware, requireRole("organizer"), async (req, res) => {
   try {
     const { name, email, phone, username, password } = req.body;
+    
+    // 1. Securely hash password for DB
     const hashed = await bcrypt.hash(password, 10);
-    const result = await pool.query(`INSERT INTO organizers (name, email, phone, username, password, role) VALUES ($1,$2,$3,$4,$5,'organizer') RETURNING *`, [name, email, phone, username, hashed]);
-    res.json({ ok: true, organizer: result.rows[0] });
-  } catch (err) { res.status(500).json({ ok: false, message: "Failed to add organizer" }); }
+    
+    // 2. Insert into organizers table
+    const result = await pool.query(
+      `INSERT INTO organizers (name, email, phone, username, password, role) 
+       VALUES ($1,$2,$3,$4,$5,'organizer') RETURNING *`, 
+      [name, email, phone, username, hashed]
+    );
+
+    // 3. Send credentials to the new Organizer
+    await resend.emails.send({
+      from: EMAIL_FROM,
+      to: email,
+      subject: "[CRITICAL] Quantum Quirks Organizer Access Granted",
+      html: getOrganizerWelcomeHtml(name, username, password)
+    });
+
+    res.json({ 
+      ok: true, 
+      organizer: result.rows[0], 
+      message: "Organizer created and secure credentials dispatched via email." 
+    });
+  } catch (err) { 
+    console.error("Organizer Creation Error:", err);
+    res.status(500).json({ ok: false, message: "Failed to add organizer. Check if username/email already exists." }); 
+  }
 });
 
 // 9. ALLOCATION
